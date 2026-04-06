@@ -1,19 +1,32 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
+const SUPA_URL = "https://nleopuntavfotcjminic.supabase.co";
+const SUPA_KEY = "sb_publishable_sgsjQy-QGShbeFDNqC6N7w_6R3sJwak";
+const SUPA_HEADERS = { apikey: SUPA_KEY, Authorization: "Bearer " + SUPA_KEY, "Content-Type": "application/json" };
+
 const storage = {
   async get(key) {
     try {
-      const v = localStorage.getItem("bh:" + key);
-      return v !== null ? { key, value: v } : null;
+      const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key) + "&select=value", { headers: SUPA_HEADERS });
+      if (!r.ok) return null;
+      const rows = await r.json();
+      return rows.length ? { key, value: rows[0].value } : null;
     } catch { return null; }
   },
   async set(key, value) {
-    try { localStorage.setItem("bh:" + key, value); return { key, value }; }
-    catch { return null; }
+    try {
+      const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data", {
+        method: "POST", headers: { ...SUPA_HEADERS, Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify({ key, value })
+      });
+      return r.ok ? { key, value } : null;
+    } catch { return null; }
   },
   async delete(key) {
-    try { localStorage.removeItem("bh:" + key); return { key, deleted: true }; }
-    catch { return null; }
+    try {
+      await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key), { method: "DELETE", headers: SUPA_HEADERS });
+      return { key, deleted: true };
+    } catch { return null; }
   }
 };
 
