@@ -2,9 +2,9 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 
 const SUPA_URL = "https://nleopuntavfotcjminic.supabase.co";
 const SUPA_KEY = "sb_publishable_sgsjQy-QGShbeFDNqC6N7w_6R3sJwak";
-const SUPA_HEADERS = { apikey: SUPA_KEY, Authorization: "Bearer " + SUPA_KEY, "Content-Type": "application/json" };
+const SUPA_HEADERS = SUPA_KEY.startsWith("eyJ") ? { apikey: SUPA_KEY, Authorization: "Bearer " + SUPA_KEY, "Content-Type": "application/json" } : { apikey: SUPA_KEY, "Content-Type": "application/json" };
 
-const storage = {
+const remote = {
   async get(key) {
     try {
       const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key) + "&select=value", { headers: SUPA_HEADERS });
@@ -28,6 +28,12 @@ const storage = {
       return { key, deleted: true };
     } catch { return null; }
   }
+};
+
+const local = {
+  get(key) { try { const v = localStorage.getItem("bh:" + key); return v !== null ? { key, value: v } : null; } catch { return null; } },
+  set(key, value) { try { localStorage.setItem("bh:" + key, value); return { key, value }; } catch { return null; } },
+  delete(key) { try { localStorage.removeItem("bh:" + key); return { key, deleted: true }; } catch { return null; } }
 };
 
 
@@ -114,7 +120,6 @@ const DEFAULT_GAMES = [
   { id: "misfits-craft", name: "MisfitsCraft", color: "#14B8A6", icon: "⛏️" },
   { id: "get-strong", name: "Get STRONG For Brainrots", color: "#DC2626", icon: "💪" },
   { id: "build-an-island", name: "Build an Island", color: "#0EA5E9", icon: "🏝️" },
-,
   { id: "parkour-for-brainrots", name: "Parkour For Brainrots!", color: "#2D6A4F", icon: "🎯" },
   { id: "throw-lucky-blocks-for-brainrots", name: "Throw Lucky Blocks for Brainrots!", color: "#8B5CF6", icon: "⚡" },
   { id: "grow-anything", name: "Grow Anything", color: "#E11D48", icon: "🔥" },
@@ -176,6 +181,8 @@ const DEFAULT_GAMES = [
   { id: "anime-surge-simulator", name: "Anime Surge Simulator", color: "#EA580C", icon: "🎊" },
 ];
 
+const _DEFAULT_GAMES_CLEAN = DEFAULT_GAMES.filter(g => g && g.id);
+
 const PRIORITIES = ["Low", "Medium", "High", "Urgent"];
 const PRIORITY_COLORS = { Low: "#94A3B8", Medium: "#3B82F6", High: "#F59E0B", Urgent: "#EF4444" };
 const PRIORITY_HINTS = { Low: "~5d turnaround", Medium: "~2d turnaround", High: "~1d turnaround", Urgent: "Same-day / ASAP" };
@@ -199,7 +206,7 @@ const SH_L = "6px 6px 0px 0px rgba(0,0,0,1)";
 const SH_S = "2px 2px 0px 0px rgba(0,0,0,1)";
 const SH_LG = "8px 8px 0px 0px rgba(0,0,0,1)";
 
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const uid = () => typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const refId = () => "BH-" + Math.random().toString(36).slice(2, 6).toUpperCase();
 
 const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -233,44 +240,74 @@ const gMap = (games) => { const m = {}; for (const g of games) if (g?.id) m[g.id
 
 const ARCHIVE_AGE_MS = 28 * 86400000;
 
-function ordersHash(o) { let h = o.length; for (let i = 0; i < o.length; i++) { const st = o[i].status || ""; for (let j = 0; j < st.length; j++) h = ((h << 5) - h + st.charCodeAt(j)) | 0; h = ((h << 5) - h + (o[i].adminNote?.length || 0) + (o[i].producerNote?.length || 0)) | 0; } return String(h); }
+function ordersHash(o) { let h = o.length; for (let i = 0; i < o.length; i++) { const s = (o[i].id || "") + (o[i].status || "") + (o[i].adminNote || "") + (o[i].producerNote || "") + (o[i].priority || ""); for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0; } return String(h); }
 function gamesHash(g) { let h = g.length; for (let i = 0; i < g.length; i++) { if (!g[i]) continue; const n = g[i].name || ""; for (let j = 0; j < n.length; j++) h = ((h << 5) - h + n.charCodeAt(j)) | 0; } return h; }
 
-let _saveTimer = null, _draftTimer = null, _lastHash = "";
+let _saveTimer = null, _draftTimer = null, _lastHash = "", _saving = false, _onSaveFail = null;
 
 async function loadOrders() {
   try {
     let a = [], b = [];
-    try { const r = await storage.get("bh-active"); if (r) a = JSON.parse(r.value); } catch {}
-    try { const r = await storage.get("bh-archive"); if (r) b = JSON.parse(r.value); } catch {}
-    if (!a.length && !b.length) { try { const legacy = await storage.get("bitohi-orders"); if (legacy) { const all = JSON.parse(legacy.value); if (all.length) { await migrateOrders(all); return all; } } } catch {} }
-    return [...a, ...b];
+    try { const r = await remote.get("bh-active"); if (r) a = JSON.parse(r.value); } catch {}
+    try { const r = await remote.get("bh-archive"); if (r) b = JSON.parse(r.value); } catch {}
+    if (!a.length && !b.length) { try { const legacy = await remote.get("bitohi-orders"); if (legacy) { const all = JSON.parse(legacy.value); if (all.length) { await migrateOrders(all); return all; } } } catch {} }
+    // Guard against split-write duplicates: if one of the two independent
+    // writes (bh-active, bh-archive) fails, an order can temporarily exist
+    // in both keys. Dedup by id. For conflicts: prefer the version whose
+    // status matches its storage bucket (terminal→archive, active→active).
+    // Fallback: prefer archive (more recent transition).
+    const byId = new Map();
+    for (const o of a) if (o?.id) byId.set(o.id, { order: o, src: "active" });
+    for (const o of b) {
+      if (!o?.id) continue;
+      const existing = byId.get(o.id);
+      if (!existing) { byId.set(o.id, { order: o, src: "archive" }); continue; }
+      // Duplicate found — pick the correct version
+      const eTerminal = TERMINAL.has(existing.order.status);
+      const oTerminal = TERMINAL.has(o.status);
+      // Prefer the version whose status matches its bucket
+      if (oTerminal && !eTerminal) byId.set(o.id, { order: o, src: "archive" });
+      // If both terminal or both active, prefer archive (later transition)
+      else if (oTerminal === eTerminal) byId.set(o.id, { order: o, src: "archive" });
+    }
+    return [...byId.values()].map(v => v.order);
   } catch { return []; }
 }
 
 async function migrateOrders(all) {
-  const now = Date.now();
-  const active = all.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-  const archive = all.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
-  await Promise.all([storage.set("bh-active", JSON.stringify(active)), storage.set("bh-archive", JSON.stringify(archive))]);
-  try { await storage.delete("bitohi-orders"); } catch {}
+  try {
+    const now = Date.now();
+    const active = all.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
+    const archive = all.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+    await Promise.all([remote.set("bh-active", JSON.stringify(active)), remote.set("bh-archive", JSON.stringify(archive))]);
+    try { await remote.delete("bitohi-orders"); } catch {}
+  } catch {}
 }
 
-function saveOrders(allOrders) {
+function saveOrders(localOrders) {
   clearTimeout(_saveTimer);
+  _saving = true;
   _saveTimer = setTimeout(async () => {
     try {
+      const remoteOrders = await loadOrders();
+      const byId = new Map();
+      for (const o of remoteOrders) byId.set(o.id, o);
+      for (const o of localOrders) byId.set(o.id, o);
+      const merged = [...byId.values()];
       const now = Date.now();
-      const active = allOrders.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-      const archive = allOrders.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
-      const archiveLite = archive.map(o => o.images?.length ? { ...o, images: [], imageCount: o.images.length } : o);
-      await Promise.all([storage.set("bh-active", JSON.stringify(active)), storage.set("bh-archive", JSON.stringify(archiveLite))]);
-      _lastHash = ordersHash(allOrders);
-    } catch {}
+      const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
+      const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+      const strip = o => o.images?.length ? { ...o, images: [], imageCount: o.images.length } : o;
+      const activeLite = active.map(strip);
+      const archiveLite = archive.map(strip);
+      await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
+      _lastHash = ordersHash([...activeLite, ...archiveLite]);
+    } catch { if (_onSaveFail) _onSaveFail(); } finally { _saving = false; }
   }, 400);
 }
 
 async function pollData(curG, setO, setG) {
+  if (_saving) return;
   try {
     const [o, g] = await Promise.all([loadOrders(), loadGames()]);
     const h = ordersHash(o);
@@ -279,29 +316,29 @@ async function pollData(curG, setO, setG) {
   } catch {}
 }
 
-async function loadDrafts(code) { try { const r = await storage.get("bh-drafts-" + code); return r ? JSON.parse(r.value) : []; } catch { return []; } }
+async function loadDrafts(code) { try { const r = await local.get("bh-drafts-" + code); return r ? JSON.parse(r.value) : []; } catch { return []; } }
 
 function saveDrafts(code, drafts) {
   clearTimeout(_draftTimer);
   _draftTimer = setTimeout(async () => {
-    try { const now = Date.now(); const lite = drafts.map(d => (now - d.updatedAt > 7 * 86400000 && d.images?.length) ? { ...d, images: [], imageCount: d.images.length } : d); await storage.set("bh-drafts-" + code, JSON.stringify(lite)); } catch {}
+    try { const now = Date.now(); const lite = drafts.map(d => (now - d.updatedAt > 7 * 86400000 && d.images?.length) ? { ...d, images: [], imageCount: d.images.length } : d); await local.set("bh-drafts-" + code, JSON.stringify(lite)); } catch {}
   }, 300);
 }
 
 async function loadGames() {
   try {
-    const r = await storage.get("bitohi-games");
-    if (!r) return DEFAULT_GAMES;
+    const r = await remote.get("bitohi-games");
+    if (!r) return _DEFAULT_GAMES_CLEAN;
     const stored = JSON.parse(r.value);
-    if (!Array.isArray(stored) || !stored.length) return DEFAULT_GAMES;
+    if (!Array.isArray(stored) || !stored.length) return _DEFAULT_GAMES_CLEAN;
     const ids = new Set(stored.filter(Boolean).map(g => g.id));
     let added = 0;
-    for (const g of DEFAULT_GAMES) { if (g && g.id && !ids.has(g.id)) { stored.push(g); added++; } }
-    if (added) { try { await storage.set("bitohi-games", JSON.stringify(stored)); } catch {} }
+    for (const g of _DEFAULT_GAMES_CLEAN) { if (!ids.has(g.id)) { stored.push(g); added++; } }
+    if (added) { try { await remote.set("bitohi-games", JSON.stringify(stored)); } catch {} }
     return stored.filter(g => g && g.id);
-  } catch { return DEFAULT_GAMES; }
+  } catch { return _DEFAULT_GAMES_CLEAN; }
 }
-async function saveGames(g) { try { await storage.set("bitohi-games", JSON.stringify(g)); } catch {} }
+async function saveGames(g) { try { await remote.set("bitohi-games", JSON.stringify(g)); } catch {} }
 
 function GlobalStyles() {
   return <style>{`@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800;900&family=Be+Vietnam+Pro:wght@300;400;500;600;700;800;900&display=swap');*,*::before,*::after{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}@keyframes asb-dropdown{from{opacity:0;max-height:0}to{opacity:1;max-height:340px}}@keyframes asb-item{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}.asb-item:hover{background:rgba(255,255,255,.06)!important}.asb-input::placeholder{color:#64748B}@keyframes login-match-pop{from{opacity:0;transform:scale(.9) translateY(6px)}to{opacity:1;transform:scale(1) translateY(0)}}@keyframes login-shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}@keyframes bh-draw{0%{stroke-dashoffset:1200;opacity:0}5%{opacity:1}100%{stroke-dashoffset:0;opacity:1}}@keyframes bh-title-in{0%{opacity:0;transform:translateY(16px) scale(.9)}100%{opacity:1;transform:translateY(0) scale(1)}}@keyframes bh-sub-in{from{opacity:0;letter-spacing:.5em}to{opacity:1;letter-spacing:.3em}}@keyframes bh-glow{0%,100%{filter:drop-shadow(0 0 6px rgba(59,130,246,0))}50%{filter:drop-shadow(0 0 18px rgba(59,130,246,.25))}}@keyframes bh-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-18px)}}@keyframes bh-progress{0%{width:0%}30%{width:35%}60%{width:58%}80%{width:72%}100%{width:100%}}@keyframes bh-sparkle{0%,100%{opacity:.4;transform:scale(.8)}50%{opacity:1;transform:scale(1.2)}}@keyframes bh-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}@keyframes app-rise{from{transform:translateY(60px);opacity:0}to{transform:translateY(0);opacity:1}}@keyframes expand-in{from{max-height:0;opacity:0}to{max-height:400px;opacity:1}}@keyframes form-shake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-4px)}40%,80%{transform:translateX(4px)}}@keyframes suc-bg{from{opacity:0}to{opacity:1}}@keyframes suc-circle-grow{0%{transform:scale(0);opacity:0}50%{transform:scale(1.15);opacity:1}100%{transform:scale(1);opacity:1}}@keyframes suc-check-draw{0%{stroke-dashoffset:60}100%{stroke-dashoffset:0}}@keyframes suc-ring-pulse{0%{transform:scale(1);opacity:.4}100%{transform:scale(2.2);opacity:0}}@keyframes suc-text-in{0%{opacity:0;transform:translateY(20px) scale(.9)}100%{opacity:1;transform:translateY(0) scale(1)}}@keyframes suc-sub-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}@keyframes suc-rocket{0%{transform:translate(-50%,-50%) scale(1) rotate(-15deg);opacity:1}15%{transform:translate(-50%,-60%) scale(1.3) rotate(-12deg);opacity:1}100%{transform:translate(-50%,-800%) scale(.3) rotate(-5deg);opacity:0}}@keyframes suc-flame{0%,100%{transform:scaleY(1) scaleX(1);opacity:.9}50%{transform:scaleY(1.4) scaleX(.8);opacity:1}}@keyframes suc-shake{0%,100%{transform:translate(-50%,-50%) rotate(-15deg)}25%{transform:translate(-48%,-51%) rotate(-17deg)}75%{transform:translate(-52%,-49%) rotate(-13deg)}}@keyframes suc-particle{0%{transform:translate(var(--tx),var(--ty)) scale(1);opacity:1}50%{opacity:.8}100%{transform:translate(calc(var(--tx)*2.5),calc(var(--ty)*2.5)) scale(0);opacity:0}}.p-btn{transition:transform .15s cubic-bezier(.34,1.56,.64,1),box-shadow .15s ease;will-change:transform}.p-btn:hover{transform:translateY(-2px);box-shadow:6px 6px 0px 0px rgba(0,0,0,1)!important}.p-btn:active{transform:translateY(1px) scale(.97);box-shadow:2px 2px 0px 0px rgba(0,0,0,1)!important;transition-duration:.08s}.p-btn-pill{transition:transform .18s cubic-bezier(.34,1.56,.64,1),box-shadow .15s ease;will-change:transform}.p-btn-pill:hover{transform:translateY(-3px) scale(1.02);box-shadow:8px 8px 0px 0px rgba(0,0,0,1)!important}.p-btn-pill:active{transform:translateY(1px) scale(.96);box-shadow:2px 2px 0px 0px rgba(0,0,0,1)!important;transition-duration:.08s}.p-btn-icon{transition:transform .15s ease;will-change:transform}.p-btn-icon:hover{transform:rotate(-8deg) scale(1.1)}.p-btn-icon:active{transform:rotate(0deg) scale(.9);transition-duration:.06s}.p-card{transition:transform .2s cubic-bezier(.34,1.56,.64,1),box-shadow .2s ease;will-change:transform}.p-card:hover{transform:translateY(-3px);box-shadow:6px 8px 0px 0px rgba(0,0,0,1)!important}.p-card-press{transition:transform .15s cubic-bezier(.34,1.56,.64,1),box-shadow .15s ease;will-change:transform;cursor:pointer}.p-card-press:hover{transform:translateY(-2px);box-shadow:6px 6px 0px 0px rgba(0,0,0,1)!important}.p-card-press:active{transform:translateY(1px) scale(.99);box-shadow:2px 2px 0px 0px rgba(0,0,0,1)!important;transition-duration:.08s}@keyframes p-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}.p-breathe{animation:p-breathe 3s ease-in-out infinite}@keyframes p-wiggle{0%,100%{transform:rotate(0deg)}25%{transform:rotate(-6deg)}75%{transform:rotate(6deg)}}.p-wiggle:hover{animation:p-wiggle .4s ease}@keyframes p-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}.p-bob{animation:p-bob 2.5s ease-in-out infinite}@keyframes p-slide-up{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}.p-slide-up{animation:p-slide-up .4s cubic-bezier(.34,1.56,.64,1) both}.p-stagger>*:nth-child(1){animation-delay:.05s}.p-stagger>*:nth-child(2){animation-delay:.1s}.p-stagger>*:nth-child(3){animation-delay:.15s}.p-stagger>*:nth-child(4){animation-delay:.2s}.p-stagger>*:nth-child(5){animation-delay:.25s}.p-stagger>*:nth-child(6){animation-delay:.3s}.p-stagger>*:nth-child(7){animation-delay:.35s}.p-stagger>*:nth-child(8){animation-delay:.4s}@keyframes p-pop{from{opacity:0;transform:scale(.8)}to{opacity:1;transform:scale(1)}}.p-pop{animation:p-pop .3s cubic-bezier(.34,1.56,.64,1) both}@keyframes p-fab-idle{0%,100%{transform:scale(1) rotate(0deg)}25%{transform:scale(1.05) rotate(3deg)}75%{transform:scale(1.05) rotate(-3deg)}}.p-fab{animation:p-fab-idle 3s ease-in-out infinite;transition:transform .15s ease;will-change:transform}.p-fab:hover{animation:none;transform:scale(1.12) rotate(90deg)}.p-fab:active{transform:scale(.92) rotate(90deg);transition-duration:.08s}.p-nav{transition:transform .12s ease;will-change:transform;position:relative}.p-nav:hover{transform:scale(1.05)}.p-nav:active{transform:scale(.95)}.p-input{transition:box-shadow .2s ease,transform .2s ease}.p-input:focus{box-shadow:6px 6px 0px 0px rgba(0,0,0,1)!important;transform:translateY(-1px)}.p-chip{transition:transform .12s ease;will-change:transform}.p-chip:hover{transform:scale(1.08)}@keyframes p-toast-in{from{transform:translateX(100%) scale(.8);opacity:0}to{transform:translateX(0) scale(1);opacity:1}}.p-toast{animation:p-toast-in .35s cubic-bezier(.34,1.56,.64,1) both}@keyframes p-dropzone-pulse{0%,100%{border-color:#0060AC;background:rgba(0,96,172,.04)}50%{border-color:#4953BC;background:rgba(0,96,172,.1)}}.p-dropzone-active{animation:p-dropzone-pulse .8s ease-in-out infinite}@media(max-width:768px){.bh-sprint-grid{grid-template-columns:repeat(2,1fr)!important;gap:6px!important}.bh-submit-cols{flex-direction:column!important}.bh-submit-cols>*:last-child{width:100%!important;flex-shrink:unset!important}.bh-nav{flex-wrap:wrap!important;gap:8px!important;padding:10px 16px!important}.bh-nav-links{gap:10px!important;width:100%;order:3;justify-content:center!important}.bh-hero{padding:20px!important}.bh-hero h2{font-size:20px!important}.bh-main{padding:20px 14px!important}.bh-deco{display:none!important}.bh-form-card{padding:16px!important}.bh-filters{overflow-x:auto;-webkit-overflow-scrolling:touch;flex-wrap:nowrap!important}.bh-filters::-webkit-scrollbar{display:none}}@media(max-width:420px){.bh-sprint-grid{grid-template-columns:1fr!important}.bh-nav-links{gap:6px!important}.bh-hero h2{font-size:16px!important}.bh-form-card{padding:12px!important}}/* ── SPRING PAGE ENTRANCE (CSS-only,triggered by React key remount) ── */ @keyframes p-spring{0%{opacity:0;transform:translateY(24px) scale(.92)}40%{opacity:1;transform:translateY(-6px) scale(1.02)}70%{transform:translateY(2px) scale(.99)}100%{opacity:1;transform:translateY(0) scale(1)}}.p-spring>*{opacity:0;animation:p-spring .45s cubic-bezier(.34,1.56,.64,1) both}.p-spring>*:nth-child(1){animation-delay:.04s}.p-spring>*:nth-child(2){animation-delay:.09s}.p-spring>*:nth-child(3){animation-delay:.14s}.p-spring>*:nth-child(4){animation-delay:.19s}.p-spring>*:nth-child(5){animation-delay:.24s}.p-spring>*:nth-child(6){animation-delay:.29s}.p-spring>*:nth-child(7){animation-delay:.34s}.p-spring>*:nth-child(8){animation-delay:.39s}.p-spring>*:nth-child(9){animation-delay:.44s}.p-spring>*:nth-child(10){animation-delay:.49s}.p-spring>*:nth-child(11){animation-delay:.54s}.p-spring>*:nth-child(12){animation-delay:.59s}@media(prefers-reduced-motion:reduce){*,.p-btn,.p-btn-pill,.p-card,.p-card-press,.p-fab,.p-breathe,.p-bob,.p-wiggle{animation:none!important;transition:none!important}.p-spring>*{animation:none!important;opacity:1!important}}`}</style>;
@@ -1195,8 +1232,8 @@ function LoginScreen({ onLogin }) {
           <div style={{ width: "100%" }}>
             <label style={{ fontFamily: F, fontWeight: 700, fontSize: 12, color: "#373830", textTransform: "uppercase", display: "block", marginBottom: 8, paddingLeft: 4 }}>PRODUCER CODE</label>
             <div key={shakeKey} style={{ animation: error ? "login-shake .4s ease" : "none" }}>
-              <input placeholder="ENTER ACCESS KEY" value={code} onChange={e => { setCode(e.target.value); setError(""); }} onKeyDown={e => e.key === "Enter" && login()} onFocus={() => setFocused(true)} onBlur={() => setFocused(false)} autoComplete="off"
-                style={{ width: "100%", height: 56, background: focused ? "#fff" : "#F5F4E7", border: BD, borderRadius: 12, padding: "0 16px", fontFamily: F, fontWeight: 700, fontSize: 15, letterSpacing: ".15em", textAlign: "center", color: "#373830", outline: "none", boxShadow: focused ? SH : "none", WebkitTextSecurity: "disc" }} />
+              <input type="password" placeholder="ENTER ACCESS KEY" value={code} onChange={e => { setCode(e.target.value); setError(""); }} onKeyDown={e => e.key === "Enter" && login()} onFocus={() => setFocused(true)} onBlur={() => setFocused(false)} autoComplete="off"
+                style={{ width: "100%", height: 56, background: focused ? "#fff" : "#F5F4E7", border: BD, borderRadius: 12, padding: "0 16px", fontFamily: F, fontWeight: 700, fontSize: 15, letterSpacing: ".15em", textAlign: "center", color: "#373830", outline: "none", boxShadow: focused ? SH : "none" }} />
             </div>
             {error && <div style={{ color: "#C0262D", fontSize: 12, fontWeight: 700, marginTop: 8, textAlign: "center", fontFamily: F }}>{error}</div>}
             {preview && !error && (
@@ -1261,13 +1298,14 @@ export default function App() {
 
   useEffect(() => {
     let dead = false;
+    _onSaveFail = () => toast.push("Failed to save — check your connection", "error");
     async function init() {
       try {
         const [o, g] = await Promise.all([loadOrders(), loadGames()]);
-        if (!dead) { setOrders(o); setGames(g); }
-        try { const saved = await storage.get("bh-login"); if (saved && !dead) { const sc = saved.value; if (PRODUCERS[sc]) { setRole("producer"); setUserCode(sc); } else if (sc === ADMIN_CODE) { setRole("admin"); setUserCode(sc); } } } catch {}
+        if (!dead) { setOrders(o); setGames(g); _lastHash = ordersHash(o); }
+        try { const saved = await local.get("bh-login"); if (saved && !dead) { const sc = saved.value; if (PRODUCERS[sc]) { setRole("producer"); setUserCode(sc); } else if (sc === ADMIN_CODE) { setRole("admin"); setUserCode(sc); } } } catch {}
       } catch {}
-      try { const sk = await storage.get("bh-skip-splash"); if (sk && !dead) setSplash("done"); } catch {}
+      try { const sk = await local.get("bh-skip-splash"); if (sk && !dead) setSplash("done"); } catch {}
       if (!dead) setDataReady(true);
     }
     init();
@@ -1280,23 +1318,76 @@ export default function App() {
   const ordersRef = useRef(orders); const gamesRef = useRef(games); ordersRef.current = orders; gamesRef.current = games;
   useEffect(() => { if (!role || splash !== "done") return; const t = setInterval(() => pollData(gamesRef.current, setOrders, setGames), POLL_MS); return () => clearInterval(t); }, [role, splash]);
 
-  const submitOrder = useCallback((data) => { setOrders(prev => { const next = [...prev, { id: uid(), ref: refId(), ...data, producerCode: userCode, status: "pending", createdAt: Date.now(), adminNote: "", tz: LOCAL_TZ }]; saveOrders(next); return next; }); }, [userCode]);
-  const updateOrder = useCallback((id, upd) => { setOrders(prev => { const next = prev.map(o => o.id === id ? { ...o, ...upd } : o); saveOrders(next); return next; }); }, []);
-  const cancelOrder = useCallback((id) => { setOrders(prev => { const next = prev.map(o => o.id === id ? { ...o, status: "cancelled" } : o); saveOrders(next); return next; }); }, []);
-  const updateGames = useCallback((g) => { setGames(g); saveGames(g); }, []);
+  // PATCH 2: Block stale-tab edits until fresh resync after focus/resume/online
+  const [resyncing, setResyncing] = useState(false);
+  const resyncingRef = useRef(false);
+  useEffect(() => {
+    if (!role || splash !== "done") return;
+    let resyncTimer = null;
+    const unlock = () => { clearTimeout(resyncTimer); resyncingRef.current = false; setResyncing(false); };
+    const doResync = async () => {
+      if (resyncingRef.current) return;
+      resyncingRef.current = true;
+      setResyncing(true);
+      // Failsafe: if poll hangs, unlock after 5s to avoid permanent lock
+      resyncTimer = setTimeout(unlock, 5000);
+      try {
+        await pollData(gamesRef.current, setOrders, setGames);
+      } catch {}
+      unlock();
+    };
+    const onVisible = () => { if (document.visibilityState === "visible") doResync(); };
+    const onFocus = () => doResync();
+    const onOnline = () => doResync();
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
+      clearTimeout(resyncTimer);
+      resyncingRef.current = false;
+    };
+  }, [role, splash]);
+
+  const submitOrder = useCallback((data) => {
+    if (resyncingRef.current) return;
+    if (!userCode || (!PRODUCERS[userCode] && userCode !== ADMIN_CODE)) return;
+    let result;
+    setOrders(prev => { result = [...prev, { id: uid(), ref: refId(), ...data, producerCode: userCode, status: "pending", createdAt: Date.now(), adminNote: "", tz: LOCAL_TZ }]; return result; });
+    if (result) saveOrders(result);
+  }, [userCode]);
+  const updateOrder = useCallback((id, upd) => {
+    if (resyncingRef.current) return;
+    let result;
+    setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, ...upd } : o); return result; });
+    if (result) saveOrders(result);
+  }, []);
+  const cancelOrder = useCallback((id) => {
+    if (resyncingRef.current) return;
+    let result;
+    setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, status: "cancelled" } : o); return result; });
+    if (result) saveOrders(result);
+  }, []);
+  const updateGames = useCallback((g) => { if (resyncingRef.current) return; setGames(g); saveGames(g); }, []);
 
   const trans = splash === "transitioning";
-  const doLogin = useCallback((r, cd) => { setRole(r); setUserCode(cd); try { storage.set("bh-login", cd); } catch {} }, []);
+  const doLogin = useCallback((r, cd) => { setRole(r); setUserCode(cd); try { local.set("bh-login", cd); } catch {} }, []);
+  if (!dataReady && splash === "done") return <div style={{ minHeight: '100vh', background: '#0B1120', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748B', fontFamily: F, fontSize: 14 }}>Loading...</div>;
   let view = <LoginScreen onLogin={doLogin} />;
-  if (role === "admin") view = <AdminView orders={orders} games={games} onUpdateOrder={updateOrder} onUpdateGames={updateGames} onLogout={() => { setRole(null); setUserCode(""); try { storage.delete("bh-login"); } catch {} }} toast={toast} />;
-  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { storage.delete("bh-login"); } catch {} }} toast={toast} />;
+  if (role === "admin") view = <AdminView orders={orders} games={games} onUpdateOrder={updateOrder} onUpdateGames={updateGames} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
+  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
 
   return (
     <div style={{ position: "relative", minHeight: "100vh", background: "#0B1120", overflow: "hidden" }}>
       <GlobalStyles />
       {splash !== "playing" && <div style={{ position: "relative", zIndex: 1, minHeight: "100vh", animation: trans ? "app-rise .8s cubic-bezier(.33,1,.68,1) forwards" : "none", opacity: trans ? 0 : 1 }}>{view}</div>}
-      {splash !== "done" && splash !== "loading" && <SplashScreen phase={splash} onSkip={() => { setSplash("transitioning"); try { storage.set("bh-skip-splash", "1"); } catch {} }} />}
+      {splash !== "done" && splash !== "loading" && <SplashScreen phase={splash} onSkip={() => { setSplash("transitioning"); try { local.set("bh-skip-splash", "1"); } catch {} }} />}
       <ToastContainer toasts={toast.toasts} />
+      {resyncing && <div style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 99997, background: "#0060AC", padding: "6px 0", textAlign: "center", fontFamily: F, fontSize: 11, fontWeight: 800, color: "#fff", letterSpacing: ".06em", textTransform: "uppercase", animation: "p-slide-up .2s ease" }}>
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}><span style={{ display: "inline-block", animation: "bh-spin 1s linear infinite", fontSize: 12 }}>⚙️</span> Refreshing latest data…</span>
+      </div>}
     </div>
   );
 }
