@@ -40,6 +40,8 @@ const local = {
 const ADMIN_CODE = "bitohi";
 const POLL_MS = 2500;
 const MAX_IMAGES = 20;
+const MAX_FILES = 10;
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const IMG_MAX_DIM = 800;
 const IMG_QUALITY = 0.7;
 
@@ -230,6 +232,19 @@ function compressImage(file) {
   });
 }
 
+function formatFileSize(b) { if (b < 1024) return b + " B"; if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB"; return (b / (1024 * 1024)).toFixed(1) + " MB"; }
+
+async function uploadFile(file) {
+  try {
+    const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
+    const path = Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.' + ext;
+    const hdrs = SUPA_KEY.startsWith("eyJ") ? { apikey: SUPA_KEY, Authorization: "Bearer " + SUPA_KEY } : { apikey: SUPA_KEY };
+    const r = await fetch(SUPA_URL + "/storage/v1/object/bitohi-files/" + encodeURIComponent(path), { method: "POST", headers: hdrs, body: file });
+    if (!r.ok) return null;
+    return { url: SUPA_URL + "/storage/v1/object/public/bitohi-files/" + encodeURIComponent(path), name: file.name, size: file.size, type: file.type || "application/octet-stream" };
+  } catch { return null; }
+}
+
 function timeAgo(ts) { const s = Math.floor((Date.now() - ts) / 1000); if (s < 10) return "just now"; if (s < 60) return s + "s ago"; const m = Math.floor(s / 60); if (m < 60) return m + "m ago"; const h = Math.floor(m / 60); if (h < 24) return h + "h ago"; const d = Math.floor(h / 24); if (d < 7) return d + "d ago"; return new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" }); }
 
 function dueDateLabel(ts) { if (!ts) return null; const diff = Math.ceil((new Date(ts).getTime() - Date.now()) / 86400000); if (diff < 0) return { text: Math.abs(diff) + "d overdue", color: "#EF4444" }; if (diff === 0) return { text: "Due today", color: "#F59E0B" }; if (diff === 1) return { text: "Due tomorrow", color: "#F59E0B" }; return { text: "Due in " + diff + "d", color: "#94A3B8" }; }
@@ -240,7 +255,7 @@ const gMap = (games) => { const m = {}; for (const g of games) if (g?.id) m[g.id
 
 const ARCHIVE_AGE_MS = 28 * 86400000;
 
-function ordersHash(o) { let h = o.length; for (let i = 0; i < o.length; i++) { const s = (o[i].id || "") + (o[i].status || "") + (o[i].adminNote || "") + (o[i].producerNote || "") + (o[i].priority || ""); for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0; } return String(h); }
+function ordersHash(o) { let h = o.length; for (let i = 0; i < o.length; i++) { const s = (o[i].id || "") + (o[i].status || "") + (o[i].adminNote || "") + (o[i].producerNote || "") + (o[i].priority || "") + (o[i].deliverables?.length || 0); for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0; } return String(h); }
 function gamesHash(g) { let h = g.length; for (let i = 0; i < g.length; i++) { if (!g[i]) continue; const n = g[i].name || ""; for (let j = 0; j < n.length; j++) h = ((h << 5) - h + n.charCodeAt(j)) | 0; } return h; }
 
 let _saveTimer = null, _draftTimer = null, _lastHash = "", _saving = false, _onSaveFail = null;
@@ -297,7 +312,7 @@ function saveOrders(localOrders) {
       const now = Date.now();
       const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
       const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
-      const strip = o => o.images?.length ? { ...o, images: [], imageCount: o.images.length } : o;
+      const strip = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
       const activeLite = active.map(strip);
       const archiveLite = archive.map(strip);
       await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
@@ -321,7 +336,7 @@ async function loadDrafts(code) { try { const r = await local.get("bh-drafts-" +
 function saveDrafts(code, drafts) {
   clearTimeout(_draftTimer);
   _draftTimer = setTimeout(async () => {
-    try { const now = Date.now(); const lite = drafts.map(d => (now - d.updatedAt > 7 * 86400000 && d.images?.length) ? { ...d, images: [], imageCount: d.images.length } : d); await local.set("bh-drafts-" + code, JSON.stringify(lite)); } catch {}
+    try { const now = Date.now(); const lite = drafts.map(d => { const dd = { ...d }; if (dd.images?.length) { dd.imageCount = dd.images.length; dd.images = []; } return dd; }); await local.set("bh-drafts-" + code, JSON.stringify(lite)); } catch {}
   }, 300);
 }
 
@@ -374,15 +389,58 @@ const DeadlineBar = ({ createdAt, dueDate }) => { if (!dueDate || !createdAt) re
   </div>
 );};
 
-const ImageThumbs = ({ images, imageCount, onRemove, onView }) => {
-  if ((!images || !images.length) && imageCount > 0) return <div style={{ marginTop: 8, padding: "6px 12px", background: "#F2F4F6", borderRadius: 8, fontSize: 11, color: "#717783", display: "flex", alignItems: "center", gap: 6 }}>📎 {imageCount} image{imageCount !== 1 ? "s" : ""} (archived)</div>;
-  if (!images?.length) return null;
-  return (<div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>{images.map((src, i) => (
-    <div key={src.slice(0, 40) || i} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: "2px solid #000", boxShadow: "2px 2px 0px 0px rgba(0,0,0,1)" }}>
-      <img src={src} alt="" loading="lazy" decoding="async" onClick={() => onView?.(src)} style={{ width: 72, height: 72, objectFit: "cover", display: "block", cursor: "pointer" }} />
-      {onRemove && <button onClick={(e) => { e.stopPropagation(); onRemove(i); }} className="p-btn-icon" style={{ position: "absolute", top: 3, right: 3, width: 20, height: 20, borderRadius: "50%", background: "#BA1A1A", border: "2px solid #000", color: "#fff", cursor: "pointer", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>×</button>}
-    </div>
-  ))}</div>);
+const FileIcon = ({ type }) => {
+  if (type?.startsWith("image/")) return "🖼️";
+  const ext = { "application/pdf": "📄", "application/zip": "📦", "text/plain": "📝" };
+  return ext[type] || "📎";
+};
+
+const Attachments = ({ files, images, imageCount, onRemove, onView, pending }) => {
+  const hasFiles = files?.length > 0;
+  const hasImages = images?.length > 0;
+  const hasPending = pending?.length > 0;
+  if (!hasFiles && !hasImages && !hasPending && imageCount > 0) return <div style={{ marginTop: 8, padding: "6px 12px", background: "#F2F4F6", borderRadius: 8, fontSize: 11, color: "#717783", display: "flex", alignItems: "center", gap: 6 }}>📎 {imageCount} attachment{imageCount !== 1 ? "s" : ""} (archived)</div>;
+  if (!hasFiles && !hasImages && !hasPending) return null;
+  return (<div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+    {hasFiles && files.map((f, i) => {
+      const isImg = f.type?.startsWith("image/");
+      if (isImg) return (
+        <div key={f.url || i} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: "2px solid #000", boxShadow: SH_S }}>
+          <img src={f.url} alt={f.name} loading="lazy" decoding="async" onClick={() => onView?.(f.url)} style={{ width: 72, height: 72, objectFit: "cover", display: "block", cursor: "pointer" }} />
+        </div>
+      );
+      return (
+        <a key={f.url || i} href={f.url} target="_blank" rel="noopener noreferrer" download={f.name} className="p-btn" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", background: "#F2F4F6", border: "2px solid #000", borderRadius: 10, boxShadow: SH_S, textDecoration: "none", color: "#414751", fontSize: 11, fontWeight: 700, fontFamily: F, maxWidth: 220 }}>
+          <span style={{ fontSize: 16 }}><FileIcon type={f.type} /></span>
+          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+          <span style={{ color: "#94A3B8", fontSize: 9, flexShrink: 0 }}>{formatFileSize(f.size)}</span>
+          <span style={{ fontSize: 12 }}>⬇</span>
+        </a>
+      );
+    })}
+    {hasImages && images.map((src, i) => (
+      <div key={(typeof src === "string" ? src.slice(0, 40) : i)} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: "2px solid #000", boxShadow: SH_S }}>
+        <img src={src} alt="" loading="lazy" decoding="async" onClick={() => onView?.(src)} style={{ width: 72, height: 72, objectFit: "cover", display: "block", cursor: "pointer" }} />
+        {onRemove && <button onClick={(e) => { e.stopPropagation(); onRemove(i); }} className="p-btn-icon" style={{ position: "absolute", top: 3, right: 3, width: 20, height: 20, borderRadius: "50%", background: "#BA1A1A", border: "2px solid #000", color: "#fff", cursor: "pointer", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>×</button>}
+      </div>
+    ))}
+    {hasPending && pending.map((pf, i) => {
+      if (pf.preview) return (
+        <div key={"pf-"+i} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: "2px solid #000", boxShadow: SH_S }}>
+          <img src={pf.preview} alt={pf.name} style={{ width: 72, height: 72, objectFit: "cover", display: "block" }} />
+          {onRemove && <button onClick={(e) => { e.stopPropagation(); onRemove(i); }} className="p-btn-icon" style={{ position: "absolute", top: 3, right: 3, width: 20, height: 20, borderRadius: "50%", background: "#BA1A1A", border: "2px solid #000", color: "#fff", cursor: "pointer", fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>×</button>}
+        </div>
+      );
+      return (
+        <div key={"pf-"+i} className="p-btn" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", background: "#F2F4F6", border: "2px solid #000", borderRadius: 10, boxShadow: SH_S, fontSize: 11, fontWeight: 700, fontFamily: F, maxWidth: 220, position: "relative" }}>
+          <span style={{ fontSize: 16 }}><FileIcon type={pf.type} /></span>
+          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#414751" }}>{pf.name}</span>
+          <span style={{ color: "#94A3B8", fontSize: 9, flexShrink: 0 }}>{formatFileSize(pf.size)}</span>
+          {onRemove && <button onClick={(e) => { e.stopPropagation(); onRemove(i); }} className="p-btn-icon" style={{ position: "absolute", top: -6, right: -6, width: 18, height: 18, borderRadius: "50%", background: "#BA1A1A", border: "2px solid #000", color: "#fff", cursor: "pointer", fontSize: 9, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 900 }}>×</button>}
+        </div>
+      );
+    })}
+  </div>);
 };
 
 const Lightbox = ({ src, onClose }) => {
@@ -747,6 +805,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const [recentGameIds, setRecentGameIds] = useState([]);
   const [drafts, setDrafts] = useState([]);
   const [editingDraftId, setEditingDraftId] = useState(null);
+  const [editingOrderId, setEditingOrderId] = useState(null);
   useEffect(() => { loadDrafts(producerCode).then(setDrafts); }, [producerCode]);
   const removeDraft = useCallback((id) => { setDrafts(prev => { const next = prev.filter(d => d.id !== id); saveDrafts(producerCode, next); return next; }); }, [producerCode]);
   const clearDraftEdit = useCallback(() => setEditingDraftId(null), []);
@@ -761,16 +820,25 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const prevStatusRef = useRef({});
   const [unseenChanges, setUnseenChanges] = useState(0);
   const clearUnseen = useCallback(() => setUnseenChanges(0), []);
-  const switchTab = useCallback((t) => { setTab(t); setBoardSearch(""); setExpandedId(null); setProdNoteId(null); if (t === "board") clearUnseen(); window.scrollTo({ top: 0, behavior: "smooth" }); }, []);
-  const [images, setImages] = useState([]);
+  const switchTab = useCallback((t) => { setTab(t); setBoardSearch(""); setExpandedId(null); setProdNoteId(null); if (t !== "submit") setEditingOrderId(null); if (t === "board") clearUnseen(); window.scrollTo({ top: 0, behavior: "smooth" }); }, []);
+  const [pendingFiles, setPendingFiles] = useState([]);
+  const [uploading, setUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const fileRef = useRef(null);
-  const addImages = useCallback(async (files) => { const results = await Promise.allSettled([...files].filter(f => f.type?.startsWith("image/")).map(compressImage)); const ok = results.filter(r => r.status === "fulfilled").map(r => r.value); if (ok.length) setImages(p => [...p, ...ok].slice(0, MAX_IMAGES)); }, []);
-  const handlePaste = useCallback((e) => { const blobs = []; for (const item of e.clipboardData?.items || []) { if (item.type.startsWith("image/")) { e.preventDefault(); const f = item.getAsFile(); if (f) blobs.push(f); } } if (blobs.length) addImages(blobs); }, [addImages]);
-  const handleDrop = useCallback((e) => { e.preventDefault(); e.stopPropagation(); addImages([...(e.dataTransfer?.files || [])].filter(f => f.type.startsWith("image/"))); }, [addImages]);
-  const removeImage = useCallback((idx) => setImages(p => p.filter((_, x) => x !== idx)), []);
-  const clearImages = useCallback(() => setImages([]), []);
-  const hasDraft = useMemo(() => !!(gameId || title.trim() || desc.trim() || images.length), [gameId, title, desc, images]);
+  const addFiles = useCallback(async (fileList) => {
+    const allowed = [...fileList].filter(f => f.size <= MAX_FILE_SIZE);
+    const items = await Promise.all(allowed.map(async f => {
+      let preview = null;
+      if (f.type.startsWith("image/")) { try { preview = await compressImage(f); } catch {} }
+      return { file: f, preview, name: f.name, size: f.size, type: f.type || "application/octet-stream" };
+    }));
+    setPendingFiles(p => [...p, ...items].slice(0, MAX_FILES));
+  }, []);
+  const handlePaste = useCallback((e) => { const blobs = []; for (const item of e.clipboardData?.items || []) { const f = item.getAsFile(); if (f) { e.preventDefault(); blobs.push(f); } } if (blobs.length) addFiles(blobs); }, [addFiles]);
+  const handleDrop = useCallback((e) => { e.preventDefault(); e.stopPropagation(); addFiles([...(e.dataTransfer?.files || [])]); }, [addFiles]);
+  const removeFile = useCallback((idx) => setPendingFiles(p => p.filter((_, x) => x !== idx)), []);
+  const clearFiles = useCallback(() => setPendingFiles([]), []);
+  const hasDraft = useMemo(() => !!(gameId || title.trim() || desc.trim() || pendingFiles.length), [gameId, title, desc, pendingFiles]);
   const gm = useMemo(() => gMap(games), [games]);
   const { myOrders, rawActiveQueue, myActive } = useMemo(() => { const my = [], aq = [], myA = []; for (const o of orders) { const mine = o.producerCode === producerCode, active = !TERMINAL.has(o.status); if (mine) { my.push(o); if (active) myA.push(o); } if (active) aq.push(o); } return { myOrders: my, rawActiveQueue: aq, myActive: myA }; }, [orders, producerCode]);
   const activeQueue = useMemo(() => { let list = rawActiveQueue; if (boardMineOnly) list = list.filter(o => o.producerCode === producerCode); if (!boardSearch.trim()) return list; const q = boardSearch.toLowerCase(); return list.filter(o => o.title.toLowerCase().includes(q) || gm[o.gameId]?.name.toLowerCase().includes(q) || PRODUCERS[o.producerCode]?.name.toLowerCase().includes(q) || (o.ref && o.ref.toLowerCase().includes(q))); }, [rawActiveQueue, boardSearch, boardMineOnly, gm, producerCode]);
@@ -788,36 +856,57 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const shakeTimerRef = useRef(null);
   const submitCooldownRef = useRef(null);
   useEffect(() => { return () => { clearTimeout(shakeTimerRef.current); clearTimeout(submitCooldownRef.current); clearTimeout(cancelTimerRef.current); }; }, []);
-  const submit = () => {
+  const submit = async () => {
     if (submittingRef.current) return;
     if (!gameId || !title.trim() || !dueDate) { setShakeForm(true); clearTimeout(shakeTimerRef.current); shakeTimerRef.current = setTimeout(() => setShakeForm(false), 500); toast.push(!gameId ? "Select a game" : !title.trim() ? "Enter a title" : "Pick a deadline", "error"); return; }
     submittingRef.current = true; clearTimeout(submitCooldownRef.current); submitCooldownRef.current = setTimeout(() => { submittingRef.current = false; }, 600);
     const gName = gm[gameId]?.name || "", tTitle = title.trim();
     const newRecent = [gameId, ...recentGameIds.filter(id => id !== gameId)].slice(0, 5);
     setRecentGameIds(newRecent);
-    onSubmit({ gameId, title: tTitle, desc: desc.trim(), priority, images, dueDate });
-    setSessionCount(n => n + 1);
-    if (batchMode) { setTitle(""); setDesc(""); clearImages(); } else { setGameId(""); setTitle(""); setDesc(""); clearImages(); setPriority("Medium"); setDueDate(""); }
+    let uploadedFiles = [];
+    if (pendingFiles.length) {
+      setUploading(true);
+      const results = await Promise.allSettled(pendingFiles.map(pf => uploadFile(pf.file)));
+      uploadedFiles = results.filter(r => r.status === "fulfilled" && r.value).map(r => r.value);
+      const failed = pendingFiles.length - uploadedFiles.length;
+      if (failed > 0) toast.push(failed + " file" + (failed !== 1 ? "s" : "") + " failed to upload", "error");
+      setUploading(false);
+    }
+    if (editingOrderId) {
+      const upd = { gameId, title: tTitle, desc: desc.trim(), priority, dueDate };
+      if (uploadedFiles.length) upd.files = uploadedFiles;
+      onUpdateOrder(editingOrderId, upd);
+      setEditingOrderId(null);
+      setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate("");
+      toast.push("Request updated", "success");
+      switchTab("board");
+    } else {
+      onSubmit({ gameId, title: tTitle, desc: desc.trim(), priority, files: uploadedFiles, dueDate });
+      setSessionCount(n => n + 1);
+      setSuccessInfo({ title: tTitle, gameName: gName, batchMode });
+    }
+    if (batchMode && !editingOrderId) { setTitle(""); setDesc(""); clearFiles(); } else if (!editingOrderId) { setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate(""); }
     if (editingDraftId) { removeDraft(editingDraftId); clearDraftEdit(); }
-    setSuccessInfo({ title: tTitle, gameName: gName, batchMode });
   };
 
   const submitRef = useRef(submit); submitRef.current = submit;
   useEffect(() => { if (tab !== "submit") return; const h = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") submitRef.current(); }; document.addEventListener("keydown", h); return () => document.removeEventListener("keydown", h); }, [tab]);
 
   const doCancel = (id) => { if (cancelConfirm === id) { onCancel(id); toast.push("Cancelled", "info"); setCancelConfirm(null); clearTimeout(cancelTimerRef.current); } else { setCancelConfirm(id); clearTimeout(cancelTimerRef.current); cancelTimerRef.current = setTimeout(() => setCancelConfirm(null), 3000); } };
-  const cloneOrder = (o) => { setGameId(o.gameId); setTitle(o.title); setDesc(o.desc || ""); setPriority(o.priority); setDueDate(""); setImages(o.images?.length ? o.images : []); switchTab("submit"); toast.push(o.images?.length ? "Cloned with " + o.images.length + " image" + (o.images.length !== 1 ? "s" : "") : o.imageCount ? "Cloned (images not available)" : "Cloned", "info"); };
+  const editOrder = (o) => { setGameId(o.gameId); setTitle(o.title); setDesc(o.desc || ""); setPriority(o.priority); setDueDate(o.dueDate || ""); setPendingFiles([]); setEditingOrderId(o.id); setEditingDraftId(null); switchTab("submit"); toast.push("Editing request — update and save", "info"); };
+  const cancelEditOrder = () => { setEditingOrderId(null); setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate(""); };
+  const cloneOrder = (o) => { setGameId(o.gameId); setTitle(o.title); setDesc(o.desc || ""); setPriority(o.priority); setDueDate(""); setPendingFiles([]); switchTab("submit"); toast.push(o.files?.length ? "Cloned (re-attach files to upload)" : "Cloned", "info"); };
 
   const saveDraft = useCallback(() => {
     if (!gameId && !title.trim() && !desc.trim()) { toast.push("Nothing to save", "error"); return; }
-    saveDraftEntry({ id: editingDraftId || undefined, gameId, title: title.trim(), desc: desc.trim(), priority, images, dueDate });
+    saveDraftEntry({ id: editingDraftId || undefined, gameId, title: title.trim(), desc: desc.trim(), priority, pendingMeta: pendingFiles.map(pf => ({ name: pf.name, size: pf.size, type: pf.type })), dueDate });
     toast.push(editingDraftId ? "Draft updated" : "Saved as draft", "success");
-    clearDraftEdit(); setGameId(""); setTitle(""); setDesc(""); clearImages(); setPriority("Medium"); setDueDate("");
+    clearDraftEdit(); setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate("");
     switchTab("drafts");
-  }, [gameId, title, desc, priority, images, dueDate, editingDraftId, saveDraftEntry, clearDraftEdit, toast.push, switchTab]);
+  }, [gameId, title, desc, priority, pendingFiles, dueDate, editingDraftId, saveDraftEntry, clearDraftEdit, toast.push, switchTab]);
   const deleteDraft = useCallback((id) => { removeDraft(id); toast.push("Draft deleted", "info"); }, [removeDraft, toast.push]);
-  const editDraft = useCallback((d) => { setGameId(d.gameId || ""); setTitle(d.title || ""); setDesc(d.desc || ""); setPriority(d.priority || "Medium"); setDueDate(d.dueDate || ""); setImages(d.images || []); setEditingDraftId(d.id); switchTab("submit"); toast.push("Editing draft", "info"); }, [switchTab, toast.push]);
-  const submitDraft = useCallback((d) => { if (!d.gameId || !d.title?.trim() || !d.dueDate) { editDraft(d); toast.push("Needs game, title & deadline", "error"); return; } onSubmit({ gameId: d.gameId, title: d.title, desc: d.desc || "", priority: d.priority || "Medium", images: d.images || [], dueDate: d.dueDate }); removeDraft(d.id); setSessionCount(n => n + 1); setSuccessInfo({ title: d.title, gameName: gm[d.gameId]?.name || "", batchMode: false }); }, [onSubmit, gm, removeDraft, editDraft, toast.push]);
+  const editDraft = useCallback((d) => { setGameId(d.gameId || ""); setTitle(d.title || ""); setDesc(d.desc || ""); setPriority(d.priority || "Medium"); setDueDate(d.dueDate || ""); setPendingFiles([]); setEditingDraftId(d.id); switchTab("submit"); toast.push("Editing draft — re-attach files if needed", "info"); }, [switchTab, toast.push]);
+  const submitDraft = useCallback((d) => { if (!d.gameId || !d.title?.trim() || !d.dueDate) { editDraft(d); toast.push("Needs game, title & deadline", "error"); return; } onSubmit({ gameId: d.gameId, title: d.title, desc: d.desc || "", priority: d.priority || "Medium", files: [], dueDate: d.dueDate }); removeDraft(d.id); setSessionCount(n => n + 1); setSuccessInfo({ title: d.title, gameName: gm[d.gameId]?.name || "", batchMode: false }); }, [onSubmit, gm, removeDraft, editDraft, toast.push]);
 
   const closeLightbox = useCallback(() => setLightboxSrc(null), []);
 
@@ -905,10 +994,12 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                   <div style={{ marginTop: 12, paddingTop: 12, borderTop: "2px solid #E0E3E5", animation: "expand-in .3s ease both", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
                     {o.desc ? <div style={{ color: "#414751", fontSize: 13, marginBottom: 8 }}>{o.desc}</div> : <div style={{ color: "#717783", fontSize: 13, fontStyle: "italic", marginBottom: 8 }}>No description</div>}
                     {o.dueDate && <div style={{ fontSize: 12, color: "#414751", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}><span>📅</span><span style={{ fontWeight: 700 }}>{fmtInTZ(o.dueDate, LOCAL_TZ)}</span><span style={{ fontSize: 10, color: "#8792FE" }}>{shortTZ(LOCAL_TZ)}</span></div>}
-                    {(o.images?.length > 0 || o.imageCount > 0) && <ImageThumbs images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                    {(o.files?.length > 0 || o.images?.length > 0 || o.imageCount > 0) && <Attachments files={o.files} images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                    {o.deliverables?.length > 0 && <div style={{ marginTop: 8, padding: "10px 14px", background: "rgba(74,222,128,.08)", borderRadius: 10, borderLeft: "4px solid #4ADE80" }}><div style={{ fontFamily: F, fontWeight: 900, color: "#4ADE80", fontSize: 10, textTransform: "uppercase", marginBottom: 6 }}>✅ Finished Files</div><Attachments files={o.deliverables} onView={setLightboxSrc} /></div>}
                     {o.adminNote && <div style={{ marginTop: 8, padding: "8px 12px", background: "#F2F4F6", borderRadius: 8, borderLeft: "3px solid #0060AC" }}><span style={{ fontFamily: F, fontWeight: 800, color: "#0060AC", fontSize: 10, textTransform: "uppercase" }}>Bitohi: </span><span style={{ color: "#414751", fontSize: 12 }}>{o.adminNote}</span></div>}
                     {o.producerNote && <div style={{ marginTop: 8, padding: "8px 12px", background: "#F2F4F6", borderRadius: 8, borderLeft: "3px solid #AD91FF" }}><span style={{ fontFamily: F, fontWeight: 800, color: "#AD91FF", fontSize: 10, textTransform: "uppercase" }}>Your Note: </span><span style={{ color: "#414751", fontSize: 12 }}>{o.producerNote}</span></div>}
                     <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                      {mine && !TERMINAL.has(o.status) && <button onClick={(e) => { e.stopPropagation(); editOrder(o); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#FACC15", border: "2px solid #000", color: "#000", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>✏️ Edit</button>}
                       {mine && <button onClick={(e) => { e.stopPropagation(); setGameId(o.gameId); setPriority(o.priority); setDesc("Follow-up to: " + o.title + (o.ref ? " (" + o.ref + ")" : "") + "\n"); switchTab("submit"); toast.push("Follow-up for " + (g?.name||""), "info"); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#E0E0FF", border: "2px solid #000", color: "#4953BC", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>+ Follow-up</button>}
                       {mine && !TERMINAL.has(o.status) && <button onClick={(e) => { e.stopPropagation(); setProdNoteId(prodNoteId === o.id ? null : o.id); setProdNoteText(o.producerNote || ""); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#F2F4F6", border: "2px solid #000", color: "#717783", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>💬 Note</button>}
                       {mine && o.status === "pending" && <button onClick={(e) => { e.stopPropagation(); doCancel(o.id); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: cancelConfirm === o.id ? "#EF4444" : "#FEE2E2", border: "2px solid #000", color: cancelConfirm === o.id ? "#fff" : "#B91C1C", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>{cancelConfirm === o.id ? "Confirm cancel?" : "Cancel"}</button>}
@@ -931,7 +1022,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
 
         {/* ── SUBMIT ── */}
         {tab === "submit" && <div className="p-spring">
-          <h2 style={{ fontFamily: F, fontSize: 24, fontWeight: 900, color: "#fff", textTransform: "uppercase", margin: "0 0 20px" }} className="bh-section-title">{editingDraftId ? "✏️ Editing Draft" : "New UI Request"}</h2>
+          <h2 style={{ fontFamily: F, fontSize: 24, fontWeight: 900, color: "#fff", textTransform: "uppercase", margin: "0 0 20px" }} className="bh-section-title">{editingOrderId ? "✏️ Editing Request" : editingDraftId ? "✏️ Editing Draft" : "New UI Request"}</h2>
           <div style={{ display: "flex", gap: 20, alignItems: "flex-start" }} className="bh-submit-cols">
             <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 14, background: "#fff", border: BD, borderRadius: 16, boxShadow: SH_L, padding: 24, animation: shakeForm ? "form-shake .4s ease" : "none" }} className="bh-form-card">
               <div style={{ position: "relative", zIndex: 100 }}><Field label="Game">
@@ -947,11 +1038,11 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                 </div>
                 <div style={{ background: "#F2F4F6", border: BD, borderRadius: 12, overflow: "hidden" }}>
                   <textarea placeholder={"What do you need?\n• Dimensions / aspect ratio\n• Style refs or color palette\n• Key elements to include\n• Any text or copy needed"} value={desc} onChange={e => { if (e.target.value.length <= 500) setDesc(e.target.value); }} onPaste={handlePaste} rows={3} style={{ width: "100%", padding: "10px 14px", background: "transparent", border: "none", color: "#191C1E", fontSize: 13, outline: "none", fontFamily: "inherit", resize: "vertical", display: "block" }} />
-                  {images.length > 0 && <div style={{ padding: "0 12px 8px" }}><ImageThumbs images={images} onRemove={removeImage} onView={setLightboxSrc} /></div>}
+                  {pendingFiles.length > 0 && <div style={{ padding: "0 12px 8px" }}><Attachments pending={pendingFiles} onRemove={removeFile} onView={setLightboxSrc} /></div>}
                   <div style={{ display: "flex", alignItems: "center", padding: "5px 12px", borderTop: "2px solid #E0E3E5" }}>
                     <button onClick={() => fileRef.current?.click()} style={{ background: "none", border: "none", cursor: "pointer", padding: "4px 8px", color: "#717783", fontSize: 16, lineHeight: 1 }}>📎</button>
-                    <input ref={fileRef} type="file" accept="image/*" multiple hidden onChange={e => { if (e.target.files) addImages(e.target.files); e.target.value = ""; }} />
-                    <span style={{ color: "#717783", fontSize: 11 }}>{images.length ? images.length + "/" + MAX_IMAGES : "Paste, drop, or 📎"}</span>
+                    <input ref={fileRef} type="file" multiple hidden onChange={e => { if (e.target.files) addFiles(e.target.files); e.target.value = ""; }} />
+                    <span style={{ color: "#717783", fontSize: 11 }}>{pendingFiles.length ? pendingFiles.length + "/" + MAX_FILES : "Paste, drop, or 📎"}</span>
                     <span style={{ marginLeft: "auto", fontSize: 10, fontWeight: 700, color: desc.length > 450 ? "#BA1A1A" : desc.length > 300 ? "#F59E0B" : "#C1C7D3", fontFamily: F }}>{desc.length > 400 ? (500 - desc.length) + " left" : desc.length + "/500"}</span>
                   </div>
                 </div>
@@ -960,8 +1051,8 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                 <div onDrop={e => { handleDrop(e); setIsDragging(false); }} onDragOver={e => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onClick={() => fileRef.current?.click()} className={isDragging ? "p-dropzone-active" : "p-card-press"} style={{ border: isDragging ? "3px solid #0060AC" : "3px dashed #C1C7D3", borderRadius: 14, padding: "28px 20px", textAlign: "center", cursor: "pointer", background: isDragging ? "rgba(0,96,172,.06)" : "transparent", transition: "all .2s ease" }}>
                   <div style={{ fontSize: 40, marginBottom: 8, opacity: isDragging ? 1 : .5, transition: "opacity .2s" }}>{isDragging ? "📥" : "📁"}</div>
                   <div style={{ fontFamily: F, fontWeight: 800, fontSize: 13, color: isDragging ? "#0060AC" : "#414751", textTransform: "uppercase", marginBottom: 4 }}>{isDragging ? "Drop files here!" : "Drop files or click to upload"}</div>
-                  <div style={{ fontSize: 11, color: "#717783" }}>PNG, JPG, GIF up to {MAX_IMAGES} images</div>
-                  {images.length > 0 && <div style={{ marginTop: 8, fontSize: 11, fontWeight: 700, color: "#0060AC" }}>{images.length} file{images.length !== 1 ? "s" : ""} attached</div>}
+                  <div style={{ fontSize: 11, color: "#717783" }}>Any file type — up to {MAX_FILES} files, 10MB each</div>
+                  {pendingFiles.length > 0 && <div style={{ marginTop: 8, fontSize: 11, fontWeight: 700, color: "#0060AC" }}>{pendingFiles.length} file{pendingFiles.length !== 1 ? "s" : ""} attached</div>}
                 </div>
               </Field>
               <Field label="Priority">
@@ -983,9 +1074,10 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                 </div>
               </div>
               {batchMode && <div style={{ fontSize: 11, color: "#717783", fontStyle: "italic", marginTop: 2 }}>Game, priority & deadline stay after submit</div>}
-              {hasDraft && <button onClick={saveDraft} className="p-btn" style={{ padding: "10px 0", borderRadius: 999, border: "2px solid #000", background: "#F2F4F6", color: "#414751", fontWeight: 900, fontSize: 12, fontFamily: F, textTransform: "uppercase", cursor: "pointer", boxShadow: SH_S, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>📝 {editingDraftId ? "UPDATE DRAFT" : "SAVE AS DRAFT"}</button>}
-              <button onClick={submit} disabled={!gameId || !title.trim() || !dueDate} className="p-btn-pill" style={{ padding: "14px 0", borderRadius: 999, cursor: gameId && title.trim() && dueDate ? "pointer" : "not-allowed", background: gameId && title.trim() && dueDate ? "linear-gradient(90deg,#4953BC,#0060AC)" : "#C1C7D3", border: BD, color: "#fff", fontWeight: 900, fontSize: 14, fontFamily: F, textTransform: "uppercase", boxShadow: gameId && title.trim() && dueDate ? SH : "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-                <span>{!gameId ? "SELECT A GAME →" : !title.trim() ? "ADD A TITLE →" : !dueDate ? "PICK A DEADLINE →" : "SUBMIT REQUEST"}</span>
+              {editingOrderId && <button onClick={cancelEditOrder} className="p-btn" style={{ padding: "10px 0", borderRadius: 999, border: "2px solid #000", background: "#FEE2E2", color: "#B91C1C", fontWeight: 900, fontSize: 12, fontFamily: F, textTransform: "uppercase", cursor: "pointer", boxShadow: SH_S, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>✕ CANCEL EDIT</button>}
+              {hasDraft && !editingOrderId && <button onClick={saveDraft} className="p-btn" style={{ padding: "10px 0", borderRadius: 999, border: "2px solid #000", background: "#F2F4F6", color: "#414751", fontWeight: 900, fontSize: 12, fontFamily: F, textTransform: "uppercase", cursor: "pointer", boxShadow: SH_S, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>📝 {editingDraftId ? "UPDATE DRAFT" : "SAVE AS DRAFT"}</button>}
+              <button onClick={submit} disabled={uploading || !gameId || !title.trim() || !dueDate} className="p-btn-pill" style={{ padding: "14px 0", borderRadius: 999, cursor: !uploading && gameId && title.trim() && dueDate ? "pointer" : "not-allowed", background: !uploading && gameId && title.trim() && dueDate ? "linear-gradient(90deg,#4953BC,#0060AC)" : "#C1C7D3", border: BD, color: "#fff", fontWeight: 900, fontSize: 14, fontFamily: F, textTransform: "uppercase", boxShadow: !uploading && gameId && title.trim() && dueDate ? SH : "none", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                <span>{uploading ? "UPLOADING FILES..." : !gameId ? "SELECT A GAME →" : !title.trim() ? "ADD A TITLE →" : !dueDate ? "PICK A DEADLINE →" : editingOrderId ? "UPDATE REQUEST" : "SUBMIT REQUEST"}</span>
                 {gameId && title.trim() && dueDate && <span style={{ fontSize: 9, opacity: .6, background: "rgba(255,255,255,.2)", padding: "2px 8px", borderRadius: 4 }}>⌘↵</span>}
               </button>
             </div>
@@ -1029,7 +1121,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                         {d.dueDate && dueDateLabel(d.dueDate) && <span style={{ color: dueDateLabel(d.dueDate).color }}>{dueDateLabel(d.dueDate).text}</span>}
                       </div>
                       {d.desc && <div style={{ color: "#414751", fontSize: 12, marginTop: 6 }}>{d.desc.length > 120 ? d.desc.slice(0,120)+"..." : d.desc}</div>}
-                      {(d.images?.length > 0 || d.imageCount > 0) && <div style={{ marginTop: 6, fontSize: 11, color: "#717783" }}>📎 {d.images?.length || d.imageCount} image{(d.images?.length || d.imageCount) !== 1 ? "s" : ""}</div>}
+                      {(d.pendingMeta?.length > 0 || d.images?.length > 0 || d.imageCount > 0) && <div style={{ marginTop: 6, fontSize: 11, color: "#717783" }}>📎 {d.pendingMeta?.length || d.images?.length || d.imageCount} file{(d.pendingMeta?.length || d.images?.length || d.imageCount) !== 1 ? "s" : ""}</div>}
                     </div>
                     <span style={{ padding: "4px 10px", borderRadius: 999, fontSize: 9, fontWeight: 900, fontFamily: F, textTransform: "uppercase", background: isReady ? "#4ADE80" : "#FACC15", border: "2px solid #000", color: "#000" }}>{isReady ? "Ready" : "Incomplete"}</span>
                   </div>
@@ -1083,7 +1175,8 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                         <span style={{ marginLeft: "auto" }}><StatusBadge status={o.status} /></span>
                       </div>
                       {o.desc && <div style={{ color: "#414751", fontSize: 12, marginTop: 4 }}>{o.desc}</div>}
-                      {(o.images?.length > 0 || o.imageCount > 0) && <ImageThumbs images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                      {(o.files?.length > 0 || o.images?.length > 0 || o.imageCount > 0) && <Attachments files={o.files} images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                    {o.deliverables?.length > 0 && <div style={{ marginTop: 8, padding: "10px 14px", background: "rgba(74,222,128,.08)", borderRadius: 10, borderLeft: "4px solid #4ADE80" }}><div style={{ fontFamily: F, fontWeight: 900, color: "#4ADE80", fontSize: 10, textTransform: "uppercase", marginBottom: 6 }}>✅ Finished Files</div><Attachments files={o.deliverables} onView={setLightboxSrc} /></div>}
                       <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, color: "#717783", fontSize: 11, flexWrap: "wrap" }}>
                         <PriorityDot priority={o.priority} /><span>{timeAgo(o.createdAt)}</span>
                       </div>
@@ -1120,6 +1213,9 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
   const [lightboxSrc, setLightboxSrc] = useState(null);
   const [adminSearch, setAdminSearch] = useState("");
   const [adminLimit, setAdminLimit] = useState(20);
+  const [adminUploading, setAdminUploading] = useState(null);
+  const adminFileRef = useRef(null);
+  const adminFileTargetRef = useRef(null);
   const closeLightbox = useCallback(() => setLightboxSrc(null), []);
   useTimeTick();
 
@@ -1131,6 +1227,25 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
   useEffect(() => { setAdminLimit(20); setNoteId(null); }, [filter, adminSearch]);
   const addGame = () => { if (!ngName.trim()) return; let id = ngName.trim().toLowerCase().replace(/[^a-z0-9]+/g,"-"); if (games.some(g => g.id === id)) id += "-" + Date.now().toString(36).slice(-4); onUpdateGames([...games, { id, name: ngName.trim(), icon: ngIcon, color: ngColor }]); setNgName(""); setNgIcon("🎮"); setNgColor("#3B82F6"); toast.push("Game added", "success"); };
   const statusAction = (id, status) => { onUpdateOrder(id, { status }); toast.push("Moved to " + (STATUS_META[status]?.label || status), "success"); };
+  const triggerAttach = (id, andComplete) => { adminFileTargetRef.current = { id, complete: andComplete }; adminFileRef.current?.click(); };
+  const handleAdminFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !adminFileTargetRef.current) return;
+    const { id, complete } = adminFileTargetRef.current;
+    adminFileTargetRef.current = null;
+    if (file.size > MAX_FILE_SIZE) { toast.push("File too large (max 10MB)", "error"); return; }
+    setAdminUploading(id);
+    const uploaded = await uploadFile(file);
+    setAdminUploading(null);
+    if (!uploaded) { toast.push("Upload failed", "error"); return; }
+    const order = orders.find(o => o.id === id);
+    const existing = order?.deliverables || [];
+    const upd = { deliverables: [...existing, uploaded] };
+    if (complete) upd.status = "completed";
+    onUpdateOrder(id, upd);
+    toast.push(complete ? "Marked done + file attached" : "File attached", "success");
+  };
 
   return (
     <div style={{ minHeight: "100vh", background: "linear-gradient(160deg, #1E293B 0%, #0F172A 50%, #1a1040 100%)", fontFamily: "'Be Vietnam Pro', sans-serif" }}>
@@ -1183,7 +1298,8 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
                   {o.dueDate&&<DeadlineBar createdAt={o.createdAt} dueDate={o.dueDate} />}
                   {o.dueDate&&dTZ&&<div style={{ fontSize: 10, color: "#64748B", marginTop: 4 }}>📅 {fmtInTZ(o.dueDate, LOCAL_TZ)} → {fmtInTZ(o.dueDate, pTZ)} ({shortTZ(pTZ)})</div>}
                   {o.desc&&<div style={{ color: "#94A3B8", fontSize: 12, marginTop: 6 }}>{o.desc}</div>}
-                  {(o.images?.length>0||o.imageCount>0)&&<ImageThumbs images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                  {(o.files?.length>0||o.images?.length>0||o.imageCount>0)&&<Attachments files={o.files} images={o.images} imageCount={o.imageCount} onView={setLightboxSrc} />}
+                  {o.deliverables?.length>0&&<div style={{ marginTop: 8 }}><div style={{ fontSize: 9, fontWeight: 900, color: "#4ADE80", fontFamily: F, textTransform: "uppercase", marginBottom: 4 }}>✅ Deliverables</div><Attachments files={o.deliverables} onView={setLightboxSrc} /></div>}
                 </div>
                 <StatusBadge status={o.status} />
               </div>
@@ -1191,9 +1307,9 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
                 {o.status==="pending"&&<><button onClick={()=>statusAction(o.id,"accepted")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#60A5FA", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>Accept</button><button onClick={()=>statusAction(o.id,"rejected")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#F87171", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>Reject</button></>}
                 {o.status==="accepted"&&<button onClick={()=>statusAction(o.id,"in-progress")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#FACC15", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>▶ Start</button>}
                 {o.status==="in-progress"&&<button onClick={()=>statusAction(o.id,"review")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#AD91FF", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>To Review</button>}
-                {o.status==="review"&&<button onClick={()=>statusAction(o.id,"completed")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#4ADE80", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>✓ Done</button>}
+                {o.status==="review"&&<><button onClick={()=>statusAction(o.id,"completed")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#4ADE80", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>✓ Done</button><button onClick={()=>triggerAttach(o.id, true)} disabled={adminUploading===o.id} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#10B981", border: "2px solid #000", color: "#fff", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>{adminUploading===o.id ? "Uploading..." : "✓ Done + 📎 File"}</button></>}
                 {o.status==="completed"&&<button onClick={()=>statusAction(o.id,"review")} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#AD91FF", border: "2px solid #000", color: "#000", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>↩ Reopen</button>}
-                {!TERMINAL.has(o.status)&&<button onClick={()=>{setNoteId(noteId===o.id?null:o.id);setNoteText(o.adminNote||"");}} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#334155", border: "2px solid #000", color: "#E2E8F0", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>💬 Note</button>}
+                {!TERMINAL.has(o.status)&&<><button onClick={()=>triggerAttach(o.id, false)} disabled={adminUploading===o.id} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#1E40AF", border: "2px solid #000", color: "#fff", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>{adminUploading===o.id ? "Uploading..." : "📎 Attach"}</button><button onClick={()=>{setNoteId(noteId===o.id?null:o.id);setNoteText(o.adminNote||"");}} className="p-btn" style={{ padding: "6px 18px", borderRadius: 999, background: "#334155", border: "2px solid #000", color: "#E2E8F0", fontWeight: 900, fontSize: 11, fontFamily: F, cursor: "pointer", textTransform: "uppercase", boxShadow: SH_S }}>💬 Note</button></>}
               </div>
               {noteId===o.id&&<div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                 <input value={noteText} onChange={e=>setNoteText(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){onUpdateOrder(o.id,{adminNote:noteText.trim()});setNoteId(null);toast.push(noteText.trim()?"Note saved":"Note cleared","success");}}} placeholder="Note for producer..." className="p-input" style={{ flex: 1, padding: "10px 14px", background: "#0F172A", border: BD, borderRadius: 10, color: "#E2E8F0", fontSize: 12, outline: "none", fontFamily: "inherit" }} />
@@ -1207,6 +1323,7 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
         </div>
       </main>
       <Lightbox src={lightboxSrc} onClose={closeLightbox} />
+      <input ref={adminFileRef} type="file" hidden onChange={handleAdminFile} />
     </div>
   );
 }
@@ -1355,7 +1472,7 @@ export default function App() {
     if (resyncingRef.current) return;
     if (!userCode || (!PRODUCERS[userCode] && userCode !== ADMIN_CODE)) return;
     let result;
-    setOrders(prev => { result = [...prev, { id: uid(), ref: refId(), ...data, producerCode: userCode, status: "pending", createdAt: Date.now(), adminNote: "", tz: LOCAL_TZ }]; return result; });
+    setOrders(prev => { const { files: orderFiles, ...rest } = data; result = [...prev, { id: uid(), ref: refId(), ...rest, files: orderFiles || [], producerCode: userCode, status: "pending", createdAt: Date.now(), adminNote: "", tz: LOCAL_TZ }]; return result; });
     if (result) saveOrders(result);
   }, [userCode]);
   const updateOrder = useCallback((id, upd) => {
