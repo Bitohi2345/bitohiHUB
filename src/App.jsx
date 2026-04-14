@@ -321,6 +321,26 @@ function saveOrders(localOrders) {
   }, 400);
 }
 
+async function saveOrdersNow(localOrders) {
+  try {
+    _saving = true;
+    const remoteOrders = await loadOrders();
+    const byId = new Map();
+    for (const o of remoteOrders) byId.set(o.id, o);
+    for (const o of localOrders) byId.set(o.id, o);
+    const merged = [...byId.values()];
+    const now = Date.now();
+    const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
+    const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+    const strip = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
+    const activeLite = active.map(strip);
+    const archiveLite = archive.map(strip);
+    await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
+    _lastHash = ordersHash([...activeLite, ...archiveLite]);
+    return true;
+  } catch { if (_onSaveFail) _onSaveFail(); return false; } finally { _saving = false; }
+}
+
 async function pollData(curG, setO, setG) {
   if (_saving) return;
   try {
@@ -785,7 +805,7 @@ function SprintCalendar({ orders, gm, producerCode, dark }) {
   );
 }
 
-function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdateOrder, onAddGame, onCancel, onLogout, toast }) {
+function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdateOrder, onForceUpdate, onAddGame, onCancel, onLogout, toast }) {
   const [gameId, setGameId] = useState("");
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
@@ -819,8 +839,9 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
 
   const prevStatusRef = useRef({});
   const [unseenChanges, setUnseenChanges] = useState(0);
+  const [seenDeliveryIds, setSeenDeliveryIds] = useState(() => { try { const s = localStorage.getItem("bh:seen-deliveries-" + producerCode); return s ? JSON.parse(s) : []; } catch { return []; } });
   const clearUnseen = useCallback(() => setUnseenChanges(0), []);
-  const switchTab = useCallback((t) => { setTab(t); setBoardSearch(""); setExpandedId(null); setProdNoteId(null); if (t !== "submit") setEditingOrderId(null); if (t === "board") clearUnseen(); window.scrollTo({ top: 0, behavior: "smooth" }); }, []);
+  const switchTab = useCallback((t) => { setTab(t); setBoardSearch(""); setExpandedId(null); setProdNoteId(null); if (t !== "submit") setEditingOrderId(null); if (t === "board") clearUnseen(); if (t === "deliveries") markDeliveriesSeenRef.current(); window.scrollTo({ top: 0, behavior: "smooth" }); }, []);
   const [pendingFiles, setPendingFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -848,7 +869,12 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const paginatedHistory = useMemo(() => [...filteredHistory].reverse().slice(0, historyLimit), [filteredHistory, historyLimit]);
   const weekGroups = useMemo(() => groupByWeek(paginatedHistory), [paginatedHistory]);
   const historyCounts = useMemo(() => { const c = { all: myOrders.length, active: 0, done: 0, cancelled: 0 }; for (const o of myOrders) { if (!TERMINAL.has(o.status)) c.active++; else if (o.status === "completed") c.done++; else c.cancelled++; } return c; }, [myOrders]);
-  useEffect(() => { const prev = prevStatusRef.current; let changed = 0; myOrders.forEach(o => { if (prev[o.id] && prev[o.id] !== o.status) { changed++; toast.push('"' + o.title + '" → ' + (STATUS_META[o.status]?.label || o.status), o.status === "rejected" ? "error" : "info"); } }); if (changed > 0 && tab !== "board") setUnseenChanges(n => n + changed); const next = {}; myOrders.forEach(o => { next[o.id] = o.status; }); prevStatusRef.current = next; }, [myOrders, toast.push, tab]);
+  const deliveries = useMemo(() => myOrders.filter(o => o.deliverables?.length > 0).sort((a, b) => (b.deliverables?.[b.deliverables.length-1]?.url ? 1 : 0) - (a.deliverables?.[a.deliverables.length-1]?.url ? 1 : 0) || b.createdAt - a.createdAt), [myOrders]);
+  const unseenDeliveries = useMemo(() => deliveries.filter(o => !seenDeliveryIds.includes(o.id)).length, [deliveries, seenDeliveryIds]);
+  const markDeliveriesSeen = useCallback(() => { const ids = deliveries.map(o => o.id); setSeenDeliveryIds(ids); try { localStorage.setItem("bh:seen-deliveries-" + producerCode, JSON.stringify(ids)); } catch {} }, [deliveries, producerCode]);
+  const markDeliveriesSeenRef = useRef(markDeliveriesSeen); markDeliveriesSeenRef.current = markDeliveriesSeen;
+  useEffect(() => { const prev = prevStatusRef.current; let changed = 0; myOrders.forEach(o => { if (prev[o.id] && prev[o.id] !== o.status) { changed++; toast.push('"' + o.title + '" → ' + (STATUS_META[o.status]?.label || o.status), o.status === "rejected" ? "error" : "info"); } }); if (changed > 0 && tab !== "board") setUnseenChanges(n => n + changed);
+    myOrders.forEach(o => { if (o.deliverables?.length && prev[o.id] && !TERMINAL.has(prev[o.id]) && o.status === "completed") toast.push('📦 "' + o.title + '" delivered!', "success"); }); const next = {}; myOrders.forEach(o => { next[o.id] = o.status; }); prevStatusRef.current = next; }, [myOrders, toast.push, tab]);
   useEffect(() => { setHistoryLimit(20); }, [historyFilter, historySearch]);
 
   const cancelTimerRef = useRef(null);
@@ -875,13 +901,14 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
     if (editingOrderId) {
       const upd = { gameId, title: tTitle, desc: desc.trim(), priority, dueDate };
       if (uploadedFiles.length) upd.files = uploadedFiles;
-      onUpdateOrder(editingOrderId, upd);
+      if (uploadedFiles.length) { await onForceUpdate(editingOrderId, upd); }
+      else onUpdateOrder(editingOrderId, upd);
       setEditingOrderId(null);
       setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate("");
       toast.push("Request updated", "success");
       switchTab("board");
     } else {
-      onSubmit({ gameId, title: tTitle, desc: desc.trim(), priority, files: uploadedFiles, dueDate });
+      await onSubmit({ gameId, title: tTitle, desc: desc.trim(), priority, files: uploadedFiles, dueDate });
       setSessionCount(n => n + 1);
       setSuccessInfo({ title: tTitle, gameName: gName, batchMode });
     }
@@ -920,11 +947,12 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
         <div style={{ display: "flex", alignItems: "center", gap: 24 }}>
           <span style={{ fontFamily: F, fontSize: 22, fontWeight: 900, color: "#fff" }}>Bitohi Hub</span>
           <div style={{ display: "flex", gap: 20, alignItems: "center" }} className="bh-nav-links">
-            {[["board","Live Board"],["calendar","Calendar"],["submit","New Request"],["drafts","Drafts"],["history","History"]].map(([k,l]) => (
+            {[["board","Live Board"],["deliveries","Deliveries"],["calendar","Calendar"],["submit","New Request"],["drafts","Drafts"],["history","History"]].map(([k,l]) => (
               <button key={k} onClick={() => switchTab(k)} className="p-nav" style={{ fontFamily: F, fontWeight: 700, fontSize: 14, background: "none", border: "none", cursor: "pointer", color: tab === k ? "#fff" : "rgba(255,255,255,.6)", borderBottom: tab === k ? "4px solid #fff" : "4px solid transparent", paddingBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
                 {l}
                 {k === "board" && unseenChanges > 0 && tab !== "board" && <span style={{ fontSize: 8, fontWeight: 900, color: "#fff", background: "#EF4444", borderRadius: 99, padding: "1px 5px", border: "1.5px solid #000", minWidth: 14, textAlign: "center", lineHeight: "12px" }}>{unseenChanges}</span>}
                 {k === "submit" && hasDraft && tab !== "submit" && <span style={{ width: 7, height: 7, borderRadius: "50%", background: "#FACC15", border: "1.5px solid #000" }} />}
+                {k === "deliveries" && unseenDeliveries > 0 && <span style={{ fontSize: 8, fontWeight: 900, color: "#fff", background: "#10B981", borderRadius: 99, padding: "1px 5px", border: "1.5px solid #000", minWidth: 14, textAlign: "center", lineHeight: "12px" }}>{unseenDeliveries}</span>}
                 {k === "drafts" && drafts.length > 0 && <span style={{ fontSize: 9, fontWeight: 900, color: "#fff", background: "#AD91FF", borderRadius: 99, padding: "1px 6px", border: "1px solid #000", minWidth: 16, textAlign: "center" }}>{drafts.length}</span>}
               </button>
             ))}
@@ -936,7 +964,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
         </div>
       </nav>
 
-      <main key={tab} style={{ maxWidth: tab === "submit" ? 960 : tab === "calendar" ? 1100 : 860, margin: "0 auto", padding: "32px 24px", position: "relative" }} className="bh-main p-spring">
+      <main key={tab} style={{ maxWidth: tab === "submit" ? 960 : tab === "calendar" ? 1100 : tab === "deliveries" ? 700 : 860, margin: "0 auto", padding: "32px 24px", position: "relative" }} className="bh-main p-spring">
 
         {/* ── BOARD ── */}
         {tab === "board" && <>
@@ -1016,6 +1044,65 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
             ))}
           </div>
         </>}
+
+
+        {/* ── DELIVERIES ── */}
+        {tab === "deliveries" && <div className="p-spring">
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+            <h2 style={{ fontFamily: F, fontSize: 22, fontWeight: 900, color: "#fff", textTransform: "uppercase", margin: 0 }} className="bh-section-title">📦 Deliveries</h2>
+            {deliveries.length > 0 && <span style={{ fontFamily: F, fontSize: 12, fontWeight: 700, color: "rgba(255,255,255,.6)" }}>{deliveries.length} delivered</span>}
+          </div>
+          {deliveries.length === 0 ? (
+            <div className="p-pop" style={{ background: "#fff", border: BD, borderRadius: 16, boxShadow: SH_L, padding: 48, textAlign: "center" }}>
+              <div style={{ fontSize: 48, marginBottom: 12 }}>📦</div>
+              <div style={{ fontFamily: F, fontSize: 16, fontWeight: 700, color: "#191C1E", marginBottom: 6 }}>No deliveries yet</div>
+              <div style={{ fontSize: 13, color: "#717783" }}>When Bitohi finishes your requests, files will appear here</div>
+            </div>
+          ) : (
+            <div className="p-stagger" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {deliveries.map(o => { const g = gm[o.gameId]; const isNew = !seenDeliveryIds.includes(o.id); return (
+                <div key={o.id} className="p-card p-slide-up" style={{ background: "#fff", border: BD, borderRadius: 14, boxShadow: SH, padding: "18px 20px", borderLeft: isNew ? "6px solid #10B981" : BD }}>
+                  <div style={{ display: "flex", alignItems: "flex-start", gap: 14, marginBottom: 10 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, flexWrap: "wrap" }}>
+                        {isNew && <span style={{ fontSize: 8, fontWeight: 900, color: "#fff", background: "#10B981", borderRadius: 99, padding: "2px 8px", border: "1.5px solid #000", fontFamily: F, textTransform: "uppercase" }}>New</span>}
+                        <span style={{ fontFamily: F, fontWeight: 900, fontSize: 15, color: "#191C1E" }}>{o.title}</span>
+                        {o.ref && <span style={{ fontSize: 9, fontWeight: 700, color: "#AD91FF", fontFamily: F }}>{o.ref}</span>}
+                      </div>
+                      {g && <div style={{ marginBottom: 8 }}><GameTag game={g} /></div>}
+                      {o.adminNote && <div style={{ marginTop: 4, padding: "8px 12px", background: "#F2F4F6", borderRadius: 8, borderLeft: "3px solid #0060AC", marginBottom: 8 }}><span style={{ fontFamily: F, fontWeight: 800, color: "#0060AC", fontSize: 10, textTransform: "uppercase" }}>Bitohi: </span><span style={{ color: "#414751", fontSize: 12 }}>{o.adminNote}</span></div>}
+                      <div style={{ padding: "12px 14px", background: "rgba(74,222,128,.06)", borderRadius: 10, borderLeft: "4px solid #4ADE80" }}>
+                        <div style={{ fontFamily: F, fontWeight: 900, color: "#10B981", fontSize: 10, textTransform: "uppercase", marginBottom: 8 }}>📁 Delivered Files</div>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          {o.deliverables.map((f, fi) => {
+                            const isImg = f.type?.startsWith("image/");
+                            if (isImg) return (
+                              <div key={fi} style={{ position: "relative", borderRadius: 10, overflow: "hidden", border: "2px solid #000", boxShadow: SH_S }}>
+                                <img src={f.url} alt={f.name} loading="lazy" style={{ width: 72, height: 72, objectFit: "cover", display: "block", cursor: "pointer" }} onClick={() => setLightboxSrc(f.url)} />
+                                <a href={f.url} download={f.name} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ position: "absolute", bottom: 2, right: 2, width: 20, height: 20, borderRadius: "50%", background: "#10B981", border: "1.5px solid #000", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#fff", textDecoration: "none" }}>⬇</a>
+                              </div>
+                            );
+                            return (
+                              <a key={fi} href={f.url} target="_blank" rel="noopener noreferrer" download={f.name} className="p-btn" style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", background: "#fff", border: "2px solid #10B981", borderRadius: 10, boxShadow: SH_S, textDecoration: "none", color: "#191C1E", fontSize: 12, fontWeight: 700, fontFamily: F, maxWidth: 280 }}>
+                                <span style={{ fontSize: 18 }}><FileIcon type={f.type} /></span>
+                                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span>
+                                <span style={{ color: "#94A3B8", fontSize: 10, flexShrink: 0 }}>{formatFileSize(f.size)}</span>
+                                <span style={{ fontSize: 14, color: "#10B981" }}>⬇</span>
+                              </a>
+                            );
+                          })}
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10, color: "#717783", fontSize: 11 }}>
+                        <StatusBadge status={o.status} />
+                        <span>{timeAgo(o.createdAt)}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );})}</div>
+          )}
+        </div>}
 
         {/* ── CALENDAR ── */}
         {tab === "calendar" && <SprintCalendar orders={orders} gm={gm} producerCode={producerCode} dark={false} />}
@@ -1203,7 +1290,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   );
 }
 
-function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toast }) {
+function AdminView({ orders, games, onUpdateOrder, onForceUpdate, onUpdateGames, onLogout, toast }) {
   const [filter, setFilter] = useState("active");
   const [noteId, setNoteId] = useState(null);
   const [noteText, setNoteText] = useState("");
@@ -1226,7 +1313,7 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
   const stats = useMemo(() => { const s = { total: orders.length, pending: 0, active: 0, done: 0, inProgress: 0, review: 0 }; for (const o of orders) { if (o.status === "pending") s.pending++; else if (o.status === "completed") s.done++; else if (o.status === "in-progress") { s.active++; s.inProgress++; } else if (o.status === "review") { s.active++; s.review++; } else if (o.status === "accepted") s.active++; } return s; }, [orders]);
   useEffect(() => { setAdminLimit(20); setNoteId(null); }, [filter, adminSearch]);
   const addGame = () => { if (!ngName.trim()) return; let id = ngName.trim().toLowerCase().replace(/[^a-z0-9]+/g,"-"); if (games.some(g => g.id === id)) id += "-" + Date.now().toString(36).slice(-4); onUpdateGames([...games, { id, name: ngName.trim(), icon: ngIcon, color: ngColor }]); setNgName(""); setNgIcon("🎮"); setNgColor("#3B82F6"); toast.push("Game added", "success"); };
-  const statusAction = (id, status) => { onUpdateOrder(id, { status }); toast.push("Moved to " + (STATUS_META[status]?.label || status), "success"); };
+  const statusAction = async (id, status) => { const ok = await onForceUpdate(id, { status }); toast.push(ok ? "Moved to " + (STATUS_META[status]?.label || status) : "Save failed — retry", ok ? "success" : "error"); };
   const triggerAttach = (id, andComplete) => { adminFileTargetRef.current = { id, complete: andComplete }; adminFileRef.current?.click(); };
   const handleAdminFile = async (e) => {
     const file = e.target.files?.[0];
@@ -1243,8 +1330,9 @@ function AdminView({ orders, games, onUpdateOrder, onUpdateGames, onLogout, toas
     const existing = order?.deliverables || [];
     const upd = { deliverables: [...existing, uploaded] };
     if (complete) upd.status = "completed";
-    onUpdateOrder(id, upd);
-    toast.push(complete ? "Marked done + file attached" : "File attached", "success");
+    const ok = await onForceUpdate(id, upd);
+    if (ok) toast.push(complete ? "✅ Delivered — file saved globally" : "📎 File attached + saved", "success");
+    else toast.push("File uploaded but save failed — try again", "error");
   };
 
   return (
@@ -1440,26 +1528,29 @@ export default function App() {
   const resyncingRef = useRef(false);
   useEffect(() => {
     if (!role || splash !== "done") return;
-    let resyncTimer = null;
+    let resyncTimer = null, hiddenAt = 0;
+    const RESYNC_THRESHOLD = 2000; // Only resync if hidden > 2s (skip file picker focus cycles)
     const unlock = () => { clearTimeout(resyncTimer); resyncingRef.current = false; setResyncing(false); };
     const doResync = async () => {
       if (resyncingRef.current) return;
       resyncingRef.current = true;
       setResyncing(true);
-      // Failsafe: if poll hangs, unlock after 5s to avoid permanent lock
       resyncTimer = setTimeout(unlock, 5000);
       try {
         await pollData(gamesRef.current, setOrders, setGames);
       } catch {}
       unlock();
     };
-    const onVisible = () => { if (document.visibilityState === "visible") doResync(); };
-    const onFocus = () => doResync();
+    const onHide = () => { if (document.visibilityState === "hidden") hiddenAt = Date.now(); };
+    const onVisible = () => { if (document.visibilityState === "visible" && hiddenAt && (Date.now() - hiddenAt) > RESYNC_THRESHOLD) doResync(); hiddenAt = 0; };
+    const onFocus = () => { if (hiddenAt && (Date.now() - hiddenAt) > RESYNC_THRESHOLD) doResync(); };
     const onOnline = () => doResync();
+    document.addEventListener("visibilitychange", onHide);
     document.addEventListener("visibilitychange", onVisible);
     window.addEventListener("focus", onFocus);
     window.addEventListener("online", onOnline);
     return () => {
+      document.removeEventListener("visibilitychange", onHide);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
       window.removeEventListener("online", onOnline);
@@ -1468,33 +1559,41 @@ export default function App() {
     };
   }, [role, splash]);
 
-  const submitOrder = useCallback((data) => {
-    if (resyncingRef.current) return;
+  const submitOrder = useCallback(async (data) => {
     if (!userCode || (!PRODUCERS[userCode] && userCode !== ADMIN_CODE)) return;
     let result;
     setOrders(prev => { const { files: orderFiles, ...rest } = data; result = [...prev, { id: uid(), ref: refId(), ...rest, files: orderFiles || [], producerCode: userCode, status: "pending", createdAt: Date.now(), adminNote: "", tz: LOCAL_TZ }]; return result; });
-    if (result) saveOrders(result);
+    if (!result) return;
+    if (data.files?.length) { await saveOrdersNow(result); }
+    else saveOrders(result);
   }, [userCode]);
   const updateOrder = useCallback((id, upd) => {
-    if (resyncingRef.current) return;
     let result;
     setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, ...upd } : o); return result; });
     if (result) saveOrders(result);
   }, []);
-  const cancelOrder = useCallback((id) => {
-    if (resyncingRef.current) return;
+  const forceUpdateOrder = useCallback(async (id, upd) => {
+    let result;
+    setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, ...upd } : o); return result; });
+    if (result) {
+      const ok = await saveOrdersNow(result);
+      return ok;
+    }
+    return false;
+  }, []);
+  const cancelOrder = useCallback(async (id) => {
     let result;
     setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, status: "cancelled" } : o); return result; });
-    if (result) saveOrders(result);
+    if (result) await saveOrdersNow(result);
   }, []);
-  const updateGames = useCallback((g) => { if (resyncingRef.current) return; setGames(g); saveGames(g); }, []);
+  const updateGames = useCallback((g) => { setGames(g); saveGames(g); }, []);
 
   const trans = splash === "transitioning";
   const doLogin = useCallback((r, cd) => { setRole(r); setUserCode(cd); try { local.set("bh-login", cd); } catch {} }, []);
   if (!dataReady && splash === "done") return <div style={{ minHeight: '100vh', background: '#0B1120', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748B', fontFamily: F, fontSize: 14 }}>Loading...</div>;
   let view = <LoginScreen onLogin={doLogin} />;
-  if (role === "admin") view = <AdminView orders={orders} games={games} onUpdateOrder={updateOrder} onUpdateGames={updateGames} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
-  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
+  if (role === "admin") view = <AdminView orders={orders} games={games} onUpdateOrder={updateOrder} onForceUpdate={forceUpdateOrder} onUpdateGames={updateGames} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
+  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onForceUpdate={forceUpdateOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
 
   return (
     <div style={{ position: "relative", minHeight: "100vh", background: "#0B1120", overflow: "hidden" }}>
