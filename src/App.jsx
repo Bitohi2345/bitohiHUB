@@ -36,10 +36,8 @@ const local = {
   delete(key) { try { localStorage.removeItem("bh:" + key); return { key, deleted: true }; } catch { return null; } }
 };
 
-
 const ADMIN_CODE = "bitohi";
 const POLL_MS = 2500;
-const MAX_IMAGES = 20;
 const MAX_FILES = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const IMG_MAX_DIM = 800;
@@ -237,7 +235,8 @@ function formatFileSize(b) { if (b < 1024) return b + " B"; if (b < 1024 * 1024)
 async function uploadFile(file) {
   try {
     const ext = (file.name.split('.').pop() || 'bin').toLowerCase();
-    const path = Date.now() + '-' + Math.random().toString(36).slice(2, 7) + '.' + ext;
+    const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = Date.now() + '-' + Math.random().toString(36).slice(2, 5) + '-' + safeName;
     const hdrs = SUPA_KEY.startsWith("eyJ") ? { apikey: SUPA_KEY, Authorization: "Bearer " + SUPA_KEY } : { apikey: SUPA_KEY };
     const r = await fetch(SUPA_URL + "/storage/v1/object/bitohi-files/" + encodeURIComponent(path), { method: "POST", headers: hdrs, body: file });
     if (!r.ok) return null;
@@ -299,46 +298,38 @@ async function migrateOrders(all) {
   } catch {}
 }
 
+const _stripForSave = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
+
+async function _mergeAndPersist(localOrders) {
+  const remoteOrders = await loadOrders();
+  const byId = new Map();
+  for (const o of remoteOrders) byId.set(o.id, o);
+  for (const o of localOrders) byId.set(o.id, o);
+  const merged = [...byId.values()];
+  const now = Date.now();
+  const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
+  const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+  const activeLite = active.map(_stripForSave);
+  const archiveLite = archive.map(_stripForSave);
+  await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
+  _lastHash = ordersHash([...activeLite, ...archiveLite]);
+}
+
 function saveOrders(localOrders) {
   clearTimeout(_saveTimer);
   _saving = true;
   _saveTimer = setTimeout(async () => {
-    try {
-      const remoteOrders = await loadOrders();
-      const byId = new Map();
-      for (const o of remoteOrders) byId.set(o.id, o);
-      for (const o of localOrders) byId.set(o.id, o);
-      const merged = [...byId.values()];
-      const now = Date.now();
-      const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-      const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
-      const strip = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
-      const activeLite = active.map(strip);
-      const archiveLite = archive.map(strip);
-      await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
-      _lastHash = ordersHash([...activeLite, ...archiveLite]);
-    } catch { if (_onSaveFail) _onSaveFail(); } finally { _saving = false; }
+    try { await _mergeAndPersist(localOrders); }
+    catch { if (_onSaveFail) _onSaveFail(); }
+    finally { _saving = false; }
   }, 400);
 }
 
 async function saveOrdersNow(localOrders) {
-  try {
-    _saving = true;
-    const remoteOrders = await loadOrders();
-    const byId = new Map();
-    for (const o of remoteOrders) byId.set(o.id, o);
-    for (const o of localOrders) byId.set(o.id, o);
-    const merged = [...byId.values()];
-    const now = Date.now();
-    const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-    const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
-    const strip = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
-    const activeLite = active.map(strip);
-    const archiveLite = archive.map(strip);
-    await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
-    _lastHash = ordersHash([...activeLite, ...archiveLite]);
-    return true;
-  } catch { if (_onSaveFail) _onSaveFail(); return false; } finally { _saving = false; }
+  _saving = true;
+  try { await _mergeAndPersist(localOrders); return true; }
+  catch { if (_onSaveFail) _onSaveFail(); return false; }
+  finally { _saving = false; }
 }
 
 async function pollData(curG, setO, setG) {
@@ -1044,7 +1035,6 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
             ))}
           </div>
         </>}
-
 
         {/* ── DELIVERIES ── */}
         {tab === "deliveries" && <div className="p-spring">
