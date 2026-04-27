@@ -6,21 +6,38 @@ const SUPA_HEADERS = SUPA_KEY.startsWith("eyJ") ? { apikey: SUPA_KEY, Authorizat
 
 const remote = {
   async get(key) {
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 10000);
     try {
-      const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key) + "&select=value", { headers: SUPA_HEADERS });
+      const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key) + "&select=value", { headers: SUPA_HEADERS, signal: ctrl.signal });
       if (!r.ok) return null;
       const rows = await r.json();
       return rows.length ? { key, value: rows[0].value } : null;
-    } catch { return null; }
+    } catch { return null; } finally { clearTimeout(timeoutId); }
+  },
+  async getStrict(key) {
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 10000);
+    try {
+      const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data?key=eq." + encodeURIComponent(key) + "&select=value", { headers: SUPA_HEADERS, signal: ctrl.signal });
+      if (!r.ok) throw new Error("Supabase read failed: " + r.status);
+      const rows = await r.json();
+      return rows.length ? { key, value: rows[0].value } : null;
+    } finally { clearTimeout(timeoutId); }
   },
   async set(key, value) {
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 10000);
     try {
       const r = await fetch(SUPA_URL + "/rest/v1/bitohi_data", {
-        method: "POST", headers: { ...SUPA_HEADERS, Prefer: "resolution=merge-duplicates" },
-        body: JSON.stringify({ key, value })
+        method: "POST",
+        headers: { ...SUPA_HEADERS, Prefer: "resolution=merge-duplicates" },
+        body: JSON.stringify({ key, value }),
+        signal: ctrl.signal
       });
-      return r.ok ? { key, value } : null;
-    } catch { return null; }
+      if (!r.ok) throw new Error("Supabase write failed: " + r.status);
+      return { key, value };
+    } finally { clearTimeout(timeoutId); }
   },
   async delete(key) {
     try {
@@ -37,7 +54,7 @@ const local = {
 };
 
 const ADMIN_CODE = "bitohi";
-const POLL_MS = 2500;
+const POLL_MS = 8000;
 const MAX_FILES = 10;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const IMG_MAX_DIM = 800;
@@ -257,7 +274,31 @@ const ARCHIVE_AGE_MS = 28 * 86400000;
 function ordersHash(o) { let h = o.length; for (let i = 0; i < o.length; i++) { const s = (o[i].id || "") + (o[i].status || "") + (o[i].adminNote || "") + (o[i].producerNote || "") + (o[i].priority || "") + (o[i].deliverables?.length || 0); for (let j = 0; j < s.length; j++) h = ((h << 5) - h + s.charCodeAt(j)) | 0; } return String(h); }
 function gamesHash(g) { let h = g.length; for (let i = 0; i < g.length; i++) { if (!g[i]) continue; const n = g[i].name || ""; for (let j = 0; j < n.length; j++) h = ((h << 5) - h + n.charCodeAt(j)) | 0; } return h; }
 
-let _saveTimer = null, _draftTimer = null, _lastHash = "", _saving = false, _onSaveFail = null;
+let _saveTimer = null, _draftTimer = null, _lastHash = "", _saving = false, _onSaveFail = null, _pendingOrders = null, _saveAttempt = 0;
+const _deletedIds = new Set();
+const _syncedIds = new Set(); // IDs confirmed present in remote (optimistic-creation protection)
+
+async function loadOrdersStrict() {
+  // Used by save merge — throws on read failure to prevent data loss
+  let a = [], b = [];
+  const ra = await remote.getStrict("bh-active");
+  if (ra) a = JSON.parse(ra.value);
+  const rb = await remote.getStrict("bh-archive");
+  if (rb) b = JSON.parse(rb.value);
+  // Dedup by id (mirror loadOrders dedup logic)
+  const byId = new Map();
+  for (const o of a) { if (o?.id) byId.set(o.id, { order: o, src: "active" }); }
+  for (const o of b) {
+    if (!o?.id) continue;
+    const existing = byId.get(o.id);
+    if (!existing) { byId.set(o.id, { order: o, src: "archive" }); continue; }
+    const eTerminal = TERMINAL.has(existing.order.status);
+    const oTerminal = TERMINAL.has(o.status);
+    if (oTerminal && !eTerminal) byId.set(o.id, { order: o, src: "archive" });
+    else if (oTerminal === eTerminal) byId.set(o.id, { order: o, src: "archive" });
+  }
+  return [...byId.values()].map(v => v.order);
+}
 
 async function loadOrders() {
   try {
@@ -291,8 +332,9 @@ async function loadOrders() {
 async function migrateOrders(all) {
   try {
     const now = Date.now();
-    const active = all.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-    const archive = all.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+    const ageMs = (o) => (typeof o.createdAt === 'number' && !isNaN(o.createdAt)) ? (now - o.createdAt) : 0;
+    const active = all.filter(o => !TERMINAL.has(o.status) || ageMs(o) < ARCHIVE_AGE_MS);
+    const archive = all.filter(o => TERMINAL.has(o.status) && ageMs(o) >= ARCHIVE_AGE_MS);
     await Promise.all([remote.set("bh-active", JSON.stringify(active)), remote.set("bh-archive", JSON.stringify(archive))]);
     try { await remote.delete("bitohi-orders"); } catch {}
   } catch {}
@@ -300,46 +342,148 @@ async function migrateOrders(all) {
 
 const _stripForSave = o => { const s = { ...o }; if (s.images?.length) { s.imageCount = (s.imageCount || 0) + s.images.length; s.images = []; } return s; };
 
+const NEW_ORDER_GRACE_MS = 300000; // 5min — generous fallback; primary protection is _syncedIds
+
 async function _mergeAndPersist(localOrders) {
-  const remoteOrders = await loadOrders();
+  // STRICT load — if remote read fails, throw to abort save (no data loss).
+  const remoteOrders = await loadOrdersStrict();
+  const remoteIds = new Set();
+  for (const o of remoteOrders) {
+    if (o?.id) {
+      remoteIds.add(o.id);
+      _syncedIds.add(o.id); // confirm sync from this read
+    }
+  }
   const byId = new Map();
-  for (const o of remoteOrders) byId.set(o.id, o);
-  for (const o of localOrders) byId.set(o.id, o);
-  const merged = [...byId.values()];
   const now = Date.now();
-  const active = merged.filter(o => !TERMINAL.has(o.status) || (now - o.createdAt) < ARCHIVE_AGE_MS);
-  const archive = merged.filter(o => TERMINAL.has(o.status) && (now - o.createdAt) >= ARCHIVE_AGE_MS);
+  // Add remote orders (skip tombstoned)
+  for (const o of remoteOrders) { if (!_deletedIds.has(o.id)) byId.set(o.id, o); }
+  // Decide each local order:
+  for (const o of localOrders) {
+    if (!o?.id || _deletedIds.has(o.id)) continue;
+    const inRemote = remoteIds.has(o.id);
+    if (inRemote) { byId.set(o.id, o); continue; } // local edit overlays remote
+    const wasSynced = _syncedIds.has(o.id);
+    if (!wasSynced) {
+      // Never confirmed in remote — optimistic local order, protect indefinitely
+      // (until either successful sync or explicit delete by user)
+      byId.set(o.id, o);
+    } else {
+      // Was synced before, no longer in remote → confirmed deleted by another session
+      // No grace window — deletion is authoritative once we've seen the absence
+      _syncedIds.delete(o.id);
+    }
+  }
+  const merged = [...byId.values()];
+  // Validate createdAt so orders with missing/invalid timestamps don't silently disappear
+  const ageMs = (o) => (typeof o.createdAt === 'number' && !isNaN(o.createdAt)) ? (now - o.createdAt) : 0;
+  const active = merged.filter(o => !TERMINAL.has(o.status) || ageMs(o) < ARCHIVE_AGE_MS);
+  const archive = merged.filter(o => TERMINAL.has(o.status) && ageMs(o) >= ARCHIVE_AGE_MS);
   const activeLite = active.map(_stripForSave);
   const archiveLite = archive.map(_stripForSave);
   await Promise.all([remote.set("bh-active", JSON.stringify(activeLite)), remote.set("bh-archive", JSON.stringify(archiveLite))]);
   _lastHash = ordersHash([...activeLite, ...archiveLite]);
+  // Mark all written orders as synced (confirmed in remote after this write)
+  const writtenIds = new Set(merged.map(o => o.id));
+  for (const o of merged) { if (o?.id) _syncedIds.add(o.id); }
+  // Clean up tombstones for IDs we successfully wrote without (they're confirmed deleted now)
+  // Snapshot to array first to avoid iterator-during-mutation foot-guns
+  for (const id of Array.from(_deletedIds)) { if (!writtenIds.has(id)) _deletedIds.delete(id); }
+  // Clean up _syncedIds for orders we no longer wrote (e.g., admin removed them)
+  for (const id of Array.from(_syncedIds)) { if (!writtenIds.has(id)) _syncedIds.delete(id); }
 }
 
 function saveOrders(localOrders) {
   clearTimeout(_saveTimer);
-  _saving = true;
-  _saveTimer = setTimeout(async () => {
-    try { await _mergeAndPersist(localOrders); }
-    catch { if (_onSaveFail) _onSaveFail(); }
-    finally { _saving = false; }
-  }, 400);
+  _saveTimer = setTimeout(() => { saveOrdersNow(localOrders); }, 400);
+}
+
+// Single drain promise — all callers chain on this. Only one drain runs at a time.
+let _drainPromise = null;
+
+async function _runDrain() {
+  // Process _pendingOrders until empty. Returns final success state.
+  let overallSuccess = true;
+  let sawAnyData = false;
+  while (_pendingOrders !== null) {
+    sawAnyData = true;
+    const delays = [0, 1500, 4000];
+    let attemptSucceeded = false;
+    for (let i = 0; i < delays.length; i++) {
+      if (delays[i]) await new Promise(r => setTimeout(r, delays[i]));
+      const snapshot = _pendingOrders;
+      try {
+        await _mergeAndPersist(snapshot);
+        attemptSucceeded = true;
+        // Only clear if no newer data arrived during save
+        if (_pendingOrders === snapshot) _pendingOrders = null;
+        break;
+      } catch {
+        if (i === delays.length - 1) {
+          if (_onSaveFail) _onSaveFail();
+          _pendingOrders = null;
+          overallSuccess = false;
+        }
+      }
+    }
+    if (!attemptSucceeded) {
+      overallSuccess = false;
+      break;
+    }
+  }
+  return sawAnyData ? overallSuccess : true;
 }
 
 async function saveOrdersNow(localOrders) {
+  _pendingOrders = localOrders; // collapse — latest write wins
+  // If drain is already running, all we need to do is await it.
+  // The running drain will pick up our _pendingOrders before it finishes.
+  if (_drainPromise) {
+    return await _drainPromise;
+  }
+  // Otherwise we own the drain. Run it and clean up.
   _saving = true;
-  try { await _mergeAndPersist(localOrders); return true; }
-  catch { if (_onSaveFail) _onSaveFail(); return false; }
-  finally { _saving = false; }
+  const myDrain = (async () => {
+    try {
+      return await _runDrain();
+    } finally {
+      _saving = false;
+      _drainPromise = null;
+    }
+  })();
+  _drainPromise = myDrain;
+  return await myDrain;
 }
 
+// Legacy alias for any leftover references (keep safe)
+async function _drainQueue() {
+  return await saveOrdersNow(_pendingOrders || []);
+}
+
+let _polling = false;
 async function pollData(curG, setO, setG) {
-  if (_saving) return;
+  if (_saving || _polling) return;
+  _polling = true;
   try {
-    const [o, g] = await Promise.all([loadOrders(), loadGames()]);
-    const h = ordersHash(o);
-    if (h !== _lastHash) { _lastHash = h; setO(o); }
+    // Use strict load: if it fails, skip this poll silently (preserve current state)
+    const [o, g] = await Promise.all([loadOrdersStrict(), loadGames()]);
+    // Update _syncedIds: anything in remote is now confirmed synced
+    const remoteIds = new Set();
+    for (const ord of o) {
+      if (ord?.id) {
+        remoteIds.add(ord.id);
+        _syncedIds.add(ord.id);
+      }
+    }
+    // Remove from _syncedIds anything that's been confirmed gone
+    for (const id of Array.from(_syncedIds)) {
+      if (!remoteIds.has(id)) _syncedIds.delete(id);
+    }
+    const filtered = o.filter(ord => !_deletedIds.has(ord.id));
+    const h = ordersHash(filtered);
+    if (h !== _lastHash) { _lastHash = h; setO(filtered); }
     if (gamesHash(g) !== gamesHash(curG)) setG(g);
-  } catch {}
+  } catch {} finally { _polling = false; }
 }
 
 async function loadDrafts(code) { try { const r = await local.get("bh-drafts-" + code); return r ? JSON.parse(r.value) : []; } catch { return []; } }
@@ -796,7 +940,62 @@ function SprintCalendar({ orders, gm, producerCode, dark }) {
   );
 }
 
-function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdateOrder, onForceUpdate, onAddGame, onCancel, onLogout, toast }) {
+
+function DeleteModal({ id, order, onClose, editingOrderId, cancelEditOrder, onDelete, toast }) {
+  const [isDeleting, setIsDeleting] = useState(false);
+  const handledRef = useRef(false);
+  // Auto-close if order disappears (deleted by another session)
+  useEffect(() => {
+    if (!order && !handledRef.current) {
+      handledRef.current = true;
+      onClose();
+    }
+  }, [order, onClose]);
+  if (!order) return null;
+  const TERMINAL_LOCAL = new Set(["completed", "cancelled", "rejected"]);
+  const onConfirm = async () => {
+    if (isDeleting || handledRef.current) return;
+    // Re-validate: must still be active when user confirms
+    if (TERMINAL_LOCAL.has(order.status)) {
+      toast.push("Order status changed — cannot delete", "error");
+      handledRef.current = true;
+      onClose();
+      return;
+    }
+    handledRef.current = true;
+    setIsDeleting(true);
+    if (editingOrderId === id) cancelEditOrder();
+    try {
+      const result = await onDelete(id);
+      if (result === 'ok') {
+        toast.push("🗑️ Request deleted", "success");
+      } else if (result === 'permission') {
+        toast.push("Cannot delete this order", "error");
+      }
+      // result === 'failed' → _onSaveFail already showed "Failed to save" toast,
+      // do NOT show a duplicate error here
+    } catch {
+      toast.push("Delete error — try again", "error");
+    }
+    onClose();
+  };
+  const onCancel = () => { if (!isDeleting) onClose(); };
+  return (
+    <div onClick={onCancel} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", backdropFilter: "blur(4px)", zIndex: 99998, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} className="p-pop" style={{ background: "#fff", border: BD, borderRadius: 16, boxShadow: SH_L, padding: "28px 32px", maxWidth: 420, width: "100%" }}>
+        <div style={{ fontFamily: F, fontWeight: 900, fontSize: 18, color: "#191C1E", marginBottom: 8 }}>Delete this request?</div>
+        <div style={{ fontSize: 13, color: "#414751", marginBottom: 6, fontWeight: 700 }}>"{order.title}"</div>
+        <div style={{ fontSize: 12, color: "#B91C1C", marginBottom: 20, fontWeight: 700 }}>This cannot be undone.</div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button onClick={onCancel} disabled={isDeleting} className="p-btn" style={{ padding: "10px 20px", borderRadius: 999, background: "#F2F4F6", border: "2px solid #000", color: "#414751", fontWeight: 700, fontSize: 12, fontFamily: F, cursor: isDeleting ? "not-allowed" : "pointer", textTransform: "uppercase", opacity: isDeleting ? 0.5 : 1 }}>Cancel</button>
+          <button onClick={onConfirm} disabled={isDeleting} className="p-btn" style={{ padding: "10px 20px", borderRadius: 999, background: isDeleting ? "#888" : "#B91C1C", border: "2px solid #000", color: "#fff", fontWeight: 900, fontSize: 12, fontFamily: F, cursor: isDeleting ? "not-allowed" : "pointer", textTransform: "uppercase" }}>{isDeleting ? "Deleting..." : "🗑️ Delete"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdateOrder, onForceUpdate, onDelete, onAddGame, onCancel, onLogout, toast }) {
   const [gameId, setGameId] = useState("");
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
@@ -817,6 +1016,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const [drafts, setDrafts] = useState([]);
   const [editingDraftId, setEditingDraftId] = useState(null);
   const [editingOrderId, setEditingOrderId] = useState(null);
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
   useEffect(() => { loadDrafts(producerCode).then(setDrafts); }, [producerCode]);
   const removeDraft = useCallback((id) => { setDrafts(prev => { const next = prev.filter(d => d.id !== id); saveDrafts(producerCode, next); return next; }); }, [producerCode]);
   const clearDraftEdit = useCallback(() => setEditingDraftId(null), []);
@@ -913,6 +1113,13 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
   const doCancel = (id) => { if (cancelConfirm === id) { onCancel(id); toast.push("Cancelled", "info"); setCancelConfirm(null); clearTimeout(cancelTimerRef.current); } else { setCancelConfirm(id); clearTimeout(cancelTimerRef.current); cancelTimerRef.current = setTimeout(() => setCancelConfirm(null), 3000); } };
   const editOrder = (o) => { setGameId(o.gameId); setTitle(o.title); setDesc(o.desc || ""); setPriority(o.priority); setDueDate(o.dueDate || ""); setPendingFiles([]); setEditingOrderId(o.id); setEditingDraftId(null); switchTab("submit"); toast.push("Editing request — update and save", "info"); };
   const cancelEditOrder = () => { setEditingOrderId(null); setGameId(""); setTitle(""); setDesc(""); clearFiles(); setPriority("Medium"); setDueDate(""); };
+  // Auto-clear edit state if the order vanishes (deleted by another session/admin)
+  useEffect(() => {
+    if (editingOrderId && !orders.find(o => o.id === editingOrderId)) {
+      cancelEditOrder();
+      toast.push("Order no longer exists — edit cancelled", "info");
+    }
+  }, [orders, editingOrderId]);
   const cloneOrder = (o) => { setGameId(o.gameId); setTitle(o.title); setDesc(o.desc || ""); setPriority(o.priority); setDueDate(""); setPendingFiles([]); switchTab("submit"); toast.push(o.files?.length ? "Cloned (re-attach files to upload)" : "Cloned", "info"); };
 
   const saveDraft = useCallback(() => {
@@ -1019,6 +1226,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
                     {o.producerNote && <div style={{ marginTop: 8, padding: "8px 12px", background: "#F2F4F6", borderRadius: 8, borderLeft: "3px solid #AD91FF" }}><span style={{ fontFamily: F, fontWeight: 800, color: "#AD91FF", fontSize: 10, textTransform: "uppercase" }}>Your Note: </span><span style={{ color: "#414751", fontSize: 12 }}>{o.producerNote}</span></div>}
                     <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
                       {mine && !TERMINAL.has(o.status) && <button onClick={(e) => { e.stopPropagation(); editOrder(o); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#FACC15", border: "2px solid #000", color: "#000", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>✏️ Edit</button>}
+                      {mine && !TERMINAL.has(o.status) && <button onClick={(e) => { e.stopPropagation(); setDeleteConfirm(o.id); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#FEE2E2", border: "2px solid #B91C1C", color: "#B91C1C", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>🗑️ Delete</button>}
                       {mine && <button onClick={(e) => { e.stopPropagation(); setGameId(o.gameId); setPriority(o.priority); setDesc("Follow-up to: " + o.title + (o.ref ? " (" + o.ref + ")" : "") + "\n"); switchTab("submit"); toast.push("Follow-up for " + (g?.name||""), "info"); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#E0E0FF", border: "2px solid #000", color: "#4953BC", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>+ Follow-up</button>}
                       {mine && !TERMINAL.has(o.status) && <button onClick={(e) => { e.stopPropagation(); setProdNoteId(prodNoteId === o.id ? null : o.id); setProdNoteText(o.producerNote || ""); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: "#F2F4F6", border: "2px solid #000", color: "#717783", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>💬 Note</button>}
                       {mine && o.status === "pending" && <button onClick={(e) => { e.stopPropagation(); doCancel(o.id); }} className="p-btn" style={{ padding: "6px 16px", borderRadius: 999, cursor: "pointer", background: cancelConfirm === o.id ? "#EF4444" : "#FEE2E2", border: "2px solid #000", color: cancelConfirm === o.id ? "#fff" : "#B91C1C", fontWeight: 700, fontSize: 11, fontFamily: F, textTransform: "uppercase" }}>{cancelConfirm === o.id ? "Confirm cancel?" : "Cancel"}</button>}
@@ -1276,6 +1484,7 @@ function ProducerView({ producer, producerCode, orders, games, onSubmit, onUpdat
       {tab !== "submit" && <button onClick={() => switchTab("submit")} className="p-fab" style={{ position: "fixed", bottom: 28, right: 28, width: 56, height: 56, background: "#AD91FF", borderRadius: "50%", border: BD, boxShadow: SH_L, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 28, color: "#fff", cursor: "pointer", zIndex: 60 }}>+</button>}
       <Lightbox src={lightboxSrc} onClose={closeLightbox} />
       {successInfo && <SuccessOverlay title={successInfo.title} gameName={successInfo.gameName} batchMode={successInfo.batchMode} onDone={() => { setSuccessInfo(null); switchTab("board"); }} onSubmitAnother={() => { setSuccessInfo(null); switchTab("submit"); }} />}
+      {deleteConfirm && <DeleteModal id={deleteConfirm} order={orders.find(x => x.id === deleteConfirm)} onClose={() => setDeleteConfirm(null)} editingOrderId={editingOrderId} cancelEditOrder={cancelEditOrder} onDelete={onDelete} toast={toast} />}
     </div>
   );
 }
@@ -1303,7 +1512,10 @@ function AdminView({ orders, games, onUpdateOrder, onForceUpdate, onUpdateGames,
   const stats = useMemo(() => { const s = { total: orders.length, pending: 0, active: 0, done: 0, inProgress: 0, review: 0 }; for (const o of orders) { if (o.status === "pending") s.pending++; else if (o.status === "completed") s.done++; else if (o.status === "in-progress") { s.active++; s.inProgress++; } else if (o.status === "review") { s.active++; s.review++; } else if (o.status === "accepted") s.active++; } return s; }, [orders]);
   useEffect(() => { setAdminLimit(20); setNoteId(null); }, [filter, adminSearch]);
   const addGame = () => { if (!ngName.trim()) return; let id = ngName.trim().toLowerCase().replace(/[^a-z0-9]+/g,"-"); if (games.some(g => g.id === id)) id += "-" + Date.now().toString(36).slice(-4); onUpdateGames([...games, { id, name: ngName.trim(), icon: ngIcon, color: ngColor }]); setNgName(""); setNgIcon("🎮"); setNgColor("#3B82F6"); toast.push("Game added", "success"); };
-  const statusAction = async (id, status) => { const ok = await onForceUpdate(id, { status }); toast.push(ok ? "Moved to " + (STATUS_META[status]?.label || status) : "Save failed — retry", ok ? "success" : "error"); };
+  const statusAction = (id, status) => {
+    toast.push("Moved to " + (STATUS_META[status]?.label || status), "success");
+    onForceUpdate(id, { status });
+  };
   const triggerAttach = (id, andComplete) => { adminFileTargetRef.current = { id, complete: andComplete }; adminFileRef.current?.click(); };
   const handleAdminFile = async (e) => {
     const file = e.target.files?.[0];
@@ -1497,7 +1709,13 @@ export default function App() {
     async function init() {
       try {
         const [o, g] = await Promise.all([loadOrders(), loadGames()]);
-        if (!dead) { setOrders(o); setGames(g); _lastHash = ordersHash(o); }
+        if (!dead) {
+          setOrders(o);
+          setGames(g);
+          _lastHash = ordersHash(o);
+          // Seed _syncedIds with initial remote state — anything we just loaded is confirmed synced
+          for (const ord of o) { if (ord?.id) _syncedIds.add(ord.id); }
+        }
         try { const saved = await local.get("bh-login"); if (saved && !dead) { const sc = saved.value; if (PRODUCERS[sc]) { setRole("producer"); setUserCode(sc); } else if (sc === ADMIN_CODE) { setRole("admin"); setUserCode(sc); } } } catch {}
       } catch {}
       try { const sk = await local.get("bh-skip-splash"); if (sk && !dead) setSplash("done"); } catch {}
@@ -1562,14 +1780,53 @@ export default function App() {
     setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, ...upd } : o); return result; });
     if (result) saveOrders(result);
   }, []);
+  const deleteOrder = useCallback(async (id) => {
+    // Returns: 'ok' on success, 'permission' if not allowed, 'failed' on save error
+    // Defense-in-depth: verify ownership and non-terminal status
+    let target;
+    setOrders(prev => { target = prev.find(o => o.id === id); return prev; });
+    if (!target) return 'permission';
+    const isAdmin = userCode === ADMIN_CODE;
+    const isOwner = target.producerCode === userCode;
+    if (!isAdmin && !isOwner) return 'permission';
+    if (!isAdmin && TERMINAL.has(target.status)) return 'permission';
+    _deletedIds.add(id);
+    let result;
+    setOrders(prev => { result = prev.filter(o => o.id !== id); return result; });
+    if (result) {
+      const ok = await saveOrdersNow(result);
+      if (!ok) {
+        _deletedIds.delete(id);
+        try {
+          const fresh = await loadOrdersStrict();
+          _lastHash = ordersHash(fresh);
+          setOrders(fresh);
+        } catch {
+          // Read also failed — keep local state. User will see save-error toast.
+        }
+        return 'failed';
+      }
+      return 'ok';
+    }
+    return 'failed';
+  }, [userCode]);
   const forceUpdateOrder = useCallback(async (id, upd) => {
     let result;
     setOrders(prev => { result = prev.map(o => o.id === id ? { ...o, ...upd } : o); return result; });
-    if (result) {
-      const ok = await saveOrdersNow(result);
-      return ok;
+    if (!result) return false;
+    const ok = await saveOrdersNow(result);
+    if (!ok) {
+      // Save failed after retry — try strict re-read to restore truth.
+      // If read also fails, leave local state alone (don't wipe UI to empty).
+      try {
+        const fresh = await loadOrdersStrict();
+        _lastHash = ordersHash(fresh);
+        setOrders(fresh);
+      } catch {
+        // Read failed too — keep current local state, user sees error toast from save
+      }
     }
-    return false;
+    return ok;
   }, []);
   const cancelOrder = useCallback(async (id) => {
     let result;
@@ -1583,7 +1840,7 @@ export default function App() {
   if (!dataReady && splash === "done") return <div style={{ minHeight: '100vh', background: '#0B1120', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748B', fontFamily: F, fontSize: 14 }}>Loading...</div>;
   let view = <LoginScreen onLogin={doLogin} />;
   if (role === "admin") view = <AdminView orders={orders} games={games} onUpdateOrder={updateOrder} onForceUpdate={forceUpdateOrder} onUpdateGames={updateGames} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
-  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onForceUpdate={forceUpdateOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
+  else if (role) view = <ProducerView producer={PRODUCERS[userCode]} producerCode={userCode} orders={orders} games={games} onSubmit={submitOrder} onUpdateOrder={updateOrder} onForceUpdate={forceUpdateOrder} onDelete={deleteOrder} onAddGame={(g) => updateGames([...games, g])} onCancel={cancelOrder} onLogout={() => { setRole(null); setUserCode(""); try { local.delete("bh-login"); } catch {} }} toast={toast} />;
 
   return (
     <div style={{ position: "relative", minHeight: "100vh", background: "#0B1120", overflow: "hidden" }}>
